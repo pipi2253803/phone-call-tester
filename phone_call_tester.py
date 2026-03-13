@@ -11,13 +11,21 @@ Android电话自动拨打测试程序
 """
 
 import sys
+import os
 import subprocess
 import re
 import time
 import threading
+import platform
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Callable
+
+# Windows 下隐藏控制台窗口
+if platform.system() == 'Windows':
+    import ctypes
+    ctypes.windll.kernel32.SetConsoleCP(65001)
+    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -121,9 +129,118 @@ class DeviceInfo:
 
 
 class ADBHelper:
-    """ADB工具类"""
+    """ADB工具类 - 带缓存优化和智能路径查找"""
     
     _adb_available: Optional[bool] = None
+    _adb_path: Optional[str] = None
+    _cache: dict = {}
+    _cache_time: float = 0
+    _cache_ttl: float = 5.0  # 缓存5秒
+    
+    @classmethod
+    def _get_cache_key(cls, cmd: tuple) -> str:
+        return '|'.join(cmd)
+    
+    @classmethod
+    def _get_cached_result(cls, cmd: tuple) -> Optional[tuple]:
+        """获取缓存结果"""
+        if time.time() - cls._cache_time > cls._cache_ttl:
+            cls._cache.clear()
+            return None
+        key = cls._get_cache_key(cmd)
+        return cls._cache.get(key)
+    
+    @classmethod
+    def _set_cached_result(cls, cmd: tuple, result: tuple):
+        """设置缓存结果"""
+        cls._cache_time = time.time()
+        key = cls._get_cache_key(cmd)
+        cls._cache[key] = result
+    
+    @classmethod
+    def _find_adb_path(cls) -> Optional[str]:
+        """智能查找ADB路径"""
+        # 首先尝试系统PATH中的adb
+        try:
+            kwargs = {}
+            if platform.system() == 'Windows':
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            
+            result = subprocess.run(
+                ['adb', 'version'],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                **kwargs
+            )
+            if result.returncode == 0:
+                return 'adb'  # 在PATH中直接使用
+        except:
+            pass
+        
+        # Windows常见安装路径
+        if platform.system() == 'Windows':
+            common_paths = [
+                # Android Studio 默认安装路径
+                os.path.expandvars(r'%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe'),
+                os.path.expandvars(r'%USERPROFILE%\AppData\Local\Android\Sdk\platform-tools\adb.exe'),
+                # 其他常见路径
+                r'C:\Android\platform-tools\adb.exe',
+                r'C:\Program Files\Android\platform-tools\adb.exe',
+                r'C:\ProgramData\Android\platform-tools\adb.exe',
+                r'C:\adb\adb.exe',
+                r'C:\platform-tools\adb.exe',
+                # 用户目录下
+                os.path.expandvars(r'%USERPROFILE%\Downloads\platform-tools\adb.exe'),
+                os.path.expandvars(r'%USERPROFILE%\Desktop\platform-tools\adb.exe'),
+            ]
+        else:
+            # macOS/Linux
+            common_paths = [
+                '/usr/local/bin/adb',
+                '/usr/bin/adb',
+                '/opt/android-sdk/platform-tools/adb',
+                os.path.expanduser('~/Library/Android/sdk/platform-tools/adb'),
+                os.path.expanduser('~/Android/Sdk/platform-tools/adb'),
+            ]
+        
+        for path in common_paths:
+            if os.path.isfile(path):
+                # 验证这个adb是否可用
+                try:
+                    kwargs = {}
+                    if platform.system() == 'Windows':
+                        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                    
+                    result = subprocess.run(
+                        [path, 'version'],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                        **kwargs
+                    )
+                    if result.returncode == 0:
+                        return path
+                except:
+                    continue
+        
+        return None
+    
+    @classmethod
+    def set_adb_path(cls, path: str) -> bool:
+        """手动设置ADB路径"""
+        if os.path.isfile(path):
+            cls._adb_path = path
+            cls._adb_available = True
+            return True
+        return False
+    
+    @classmethod
+    def get_adb_path(cls) -> str:
+        """获取ADB路径"""
+        if cls._adb_path is None:
+            cls._adb_path = cls._find_adb_path()
+        return cls._adb_path or 'adb'
     
     @classmethod
     def check_adb_installed(cls) -> bool:
@@ -131,45 +248,59 @@ class ADBHelper:
         if cls._adb_available is not None:
             return cls._adb_available
         
-        try:
-            result = subprocess.run(
-                ['adb', 'version'],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                encoding='utf-8',
-                errors='ignore'
-            )
-            cls._adb_available = result.returncode == 0
-            return cls._adb_available
-        except Exception:
-            cls._adb_available = False
-            return False
+        cls._adb_path = cls._find_adb_path()
+        cls._adb_available = cls._adb_path is not None
+        return cls._adb_available
     
-    @staticmethod
-    def execute_command(cmd: List[str], timeout: int = 30) -> tuple:
-        """执行ADB命令"""
+    @classmethod
+    def execute_command(cls, cmd: List[str], timeout: int = 30, use_cache: bool = False) -> tuple:
+        """执行ADB命令 - 支持缓存和自动路径查找"""
+        # 确保使用正确的ADB路径
+        if len(cmd) > 0 and cmd[0] == 'adb':
+            adb_path = cls.get_adb_path()
+            cmd = [adb_path] + cmd[1:]
+        
+        cmd_tuple = tuple(cmd)
+        
+        # 检查缓存
+        if use_cache:
+            cached = cls._get_cached_result(cmd_tuple)
+            if cached is not None:
+                return cached
+        
         try:
+            # Windows 下隐藏控制台窗口
+            kwargs = {}
+            if platform.system() == 'Windows':
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 encoding='utf-8',
-                errors='ignore'
+                errors='ignore',
+                **kwargs
             )
-            return result.returncode == 0, result.stdout, result.stderr
+            result_tuple = (result.returncode == 0, result.stdout, result.stderr)
+            
+            # 设置缓存
+            if use_cache:
+                cls._set_cached_result(cmd_tuple, result_tuple)
+            
+            return result_tuple
         except subprocess.TimeoutExpired:
             return False, "", "Command timeout"
         except FileNotFoundError:
-            return False, "", "ADB not found. Please install Android Platform Tools."
+            return False, "", f"ADB not found at: {cmd[0] if cmd else 'unknown'}. Please install Android Platform Tools or set ADB path."
         except Exception as e:
             return False, "", str(e)
     
     @classmethod
     def get_devices(cls) -> List[str]:
-        """获取已连接的设备列表"""
-        success, stdout, stderr = cls.execute_command(['adb', 'devices'])
+        """获取已连接的设备列表 - 使用缓存避免卡顿"""
+        success, stdout, stderr = cls.execute_command(['adb', 'devices'], use_cache=True)
         if not success:
             return []
         
@@ -1142,9 +1273,39 @@ class MainWindow(QMainWindow):
         self.device_combo.currentIndexChanged.connect(self.on_device_selected)
         device_layout.addWidget(self.device_combo)
         
-        # 刷新按钮
+        # 刷新按钮和自动检测开关
         refresh_layout = QHBoxLayout()
         refresh_layout.addStretch()
+        
+        # 自动检测复选框
+        from PyQt6.QtWidgets import QCheckBox
+        self.auto_refresh_check = QCheckBox("自动检测")
+        self.auto_refresh_check.setChecked(True)
+        self.auto_refresh_check.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.auto_refresh_check.stateChanged.connect(self._toggle_auto_refresh)
+        refresh_layout.addWidget(self.auto_refresh_check)
+        refresh_layout.addSpacing(10)
+        
+        # 手动指定ADB按钮
+        self.set_adb_btn = QPushButton("📁 指定ADB")
+        self.set_adb_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['warning']};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['warning']}dd;
+            }}
+        """)
+        self.set_adb_btn.setToolTip("如果自动检测失败，请手动指定adb.exe路径")
+        self.set_adb_btn.clicked.connect(self._set_adb_path_manual)
+        refresh_layout.addWidget(self.set_adb_btn)
+        refresh_layout.addSpacing(10)
+        
         self.refresh_btn = IconButton(ICONS['refresh'], "刷新设备", COLORS['info'])
         self.refresh_btn.setStyleSheet(self.refresh_btn.styleSheet().replace("12px 24px", "8px 16px"))
         self.refresh_btn.clicked.connect(self.refresh_devices)
@@ -3108,11 +3269,57 @@ class MainWindow(QMainWindow):
         
         return card
     
+    def _toggle_auto_refresh(self, state):
+        """切换自动检测状态"""
+        if hasattr(self, 'device_check_timer'):
+            if state == Qt.CheckState.Checked.value:
+                self.device_check_timer.start(10000)
+                self.log("已开启自动检测设备", "info")
+            else:
+                self.device_check_timer.stop()
+                self.log("已关闭自动检测（手动点击刷新）", "info")
+    
+    def _set_adb_path_manual(self):
+        """手动设置ADB路径"""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        
+        # 显示提示信息
+        QMessageBox.information(
+            self,
+            "选择ADB可执行文件",
+            "请找到并选择 adb.exe 文件\n\n"
+            "常见位置：\n"
+            "• Android Studio: C:\\Users\\<用户名>\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe\n"
+            "• 独立安装: C:\\platform-tools\\adb.exe\n"
+            "• 其他: 您下载的platform-tools文件夹中"
+        )
+        
+        # 打开文件选择对话框
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择ADB可执行文件",
+            "",
+            "ADB Executable (adb.exe);;All Files (*.*)"
+        )
+        
+        if file_path:
+            if os.path.basename(file_path).lower() in ['adb.exe', 'adb']:
+                if ADBHelper.set_adb_path(file_path):
+                    self.log(f"✅ ADB路径已设置: {file_path}", "success")
+                    self.status_bar.showMessage(f"{ICONS['success']} ADB路径已手动指定")
+                    # 重置ADB可用性缓存，重新检测
+                    ADBHelper._adb_available = None
+                    self.refresh_devices()
+                else:
+                    QMessageBox.warning(self, "无效文件", "选择的文件无法执行，请确认是有效的adb.exe")
+            else:
+                QMessageBox.warning(self, "文件名错误", f"请选择 adb.exe，而不是 {os.path.basename(file_path)}")
+    
     def start_device_check(self):
-        """启动设备检测定时器"""
+        """启动设备检测定时器 - 优化频率避免卡顿"""
         self.device_check_timer = QTimer(self)
         self.device_check_timer.timeout.connect(self.refresh_devices)
-        self.device_check_timer.start(3000)  # 每3秒检测一次
+        self.device_check_timer.start(10000)  # 每10秒检测一次（降低频率避免卡顿）
         self.refresh_devices()
     
     def refresh_devices(self):
@@ -3120,15 +3327,16 @@ class MainWindow(QMainWindow):
         # 首先检查ADB是否已安装
         if not ADBHelper.check_adb_installed():
             self.device_combo.clear()
-            self.device_combo.addItem(f"{ICONS['warning']} 请先安装ADB工具")
+            self.device_combo.addItem(f"{ICONS['warning']} 未找到ADB，点击手动指定")
             self.clear_device_info()
-            self.status_bar.showMessage(f"{ICONS['error']} ADB未安装")
-            self.connection_status.setText("未安装")
+            self.status_bar.showMessage(f"{ICONS['error']} ADB未找到 - 请安装或手动指定路径")
+            self.connection_status.setText("未找到ADB")
             self.connection_status.set_status("error")
             # 强制显示关键状态变化
             if self._last_connection_status != "no_adb":
                 self._last_connection_status = "no_adb"
-                self.log("请先安装ADB工具", "error")
+                self.log("未找到ADB工具，常见路径已搜索完毕", "error")
+                self.log("请尝试：1. 点击刷新按钮右侧的'手动指定ADB' 2. 或安装Android Studio", "info")
             return
         
         devices = ADBHelper.get_devices()
@@ -3660,7 +3868,17 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    
+    # 根据操作系统设置风格
+    if platform.system() == 'Windows':
+        # Windows 使用原生风格
+        app.setStyle('Windows')
+        # 设置 Windows 字体
+        font = QFont("Microsoft YaHei", 9)
+        app.setFont(font)
+    else:
+        # macOS/Linux 使用 Fusion 风格
+        app.setStyle('Fusion')
     
     # 设置应用程序全局样式
     app.setStyleSheet(f"""
