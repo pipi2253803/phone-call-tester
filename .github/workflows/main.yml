@@ -1,0 +1,50 @@
+```yaml
+name: Build Desktop Executables
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - run: pip install pyinstaller PyQt6 pandas openpyxl
+    - run: python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
+    - uses: actions/upload-artifact@v4
+      with:
+        name: PhoneCallTester-Windows
+        path: dist/PhoneCallTester.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - run: pip install pyinstaller PyQt6 pandas openpyxl
+    - run: python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
+    - uses: actions/upload-artifact@v4
+      with:
+        name: PhoneCallTester-macOS
+        path: dist/PhoneCallTester.app
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - run: sudo apt-get update && sudo apt-get install -y libegl1
+    - run: pip install pyinstaller PyQt6 pandas openpyxl
+    - run: python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
+    - uses: actions/upload-artifact@v4
+      with:
+        name: PhoneCallTester-Linux
+        path: dist/PhoneCallTester
+```
