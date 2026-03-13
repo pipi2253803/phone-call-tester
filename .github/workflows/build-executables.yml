@@ -1,103 +1,78 @@
-name: Build Desktop Executables
-
 on:
-  workflow_dispatch:  # 手动触发
   push:
-    branches: [ main ]
-    paths:
-      - 'phone_call_tester.py'
-      - 'build_executable.*'
-      - '.github/workflows/build-executables.yml'
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  # Windows 打包
   build-windows:
     runs-on: windows-latest
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
     
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v4
       with:
         python-version: '3.11'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller PyQt6 pandas openpyxl
+        pip install PyQt6 PyQt6-WebEngine folium requests pyinstaller
     
-    - name: Build Windows executable
+    - name: Build EXE with PyInstaller
       run: |
-        python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
+        pyinstaller --onefile --windowed --name "PhoneCallTester" phone_call_tester.py
     
-    - name: Upload Windows artifact
-      uses: actions/upload-artifact@v4
+    - name: Copy additional files
+      run: |
+        copy README.md dist\
+        copy VERSION.md dist\
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
       with:
         name: PhoneCallTester-Windows
-        path: dist/PhoneCallTester.exe
-        if-no-files-found: error
+        path: dist/
+    
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/PhoneCallTester.exe
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # macOS 打包
   build-macos:
     runs-on: macos-latest
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
     
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v4
       with:
         python-version: '3.11'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller PyQt6 pandas openpyxl
+        pip install PyQt6 PyQt6-WebEngine folium requests pyinstaller
     
-    - name: Build macOS executable
+    - name: Build macOS App
       run: |
-        python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
+        pyinstaller --onefile --windowed --name "PhoneCallTester" phone_call_tester.py
     
-    - name: Upload macOS artifact
-      uses: actions/upload-artifact@v4
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
       with:
         name: PhoneCallTester-macOS
-        path: dist/PhoneCallTester.app
-        if-no-files-found: error
-
-  # Linux 打包
-  build-linux:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libegl1 libxkbcommon-x11-0
-    
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller PyQt6 pandas openpyxl
-    
-    - name: Build Linux executable
-      run: |
-        python -m PyInstaller --name="PhoneCallTester" --windowed --onefile --clean --noconfirm --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtWidgets --hidden-import=pandas --hidden-import=openpyxl --exclude-module=matplotlib --exclude-module=scipy --exclude-module=tkinter phone_call_tester.py
-    
-    - name: Upload Linux artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: PhoneCallTester-Linux
-        path: dist/PhoneCallTester
-        if-no-files-found: error
+        path: dist/
