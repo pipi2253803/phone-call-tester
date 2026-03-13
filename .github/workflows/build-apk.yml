@@ -1,0 +1,39 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install briefcase toga-android
+
+      - name: Create Android project
+        working-directory: ./android_phone_tester
+        run: briefcase create android
+
+      - name: Build Android APK
+        working-directory: ./android_phone_tester
+        run: briefcase build android
+
+      - name: Package APK
+        working-directory: ./android_phone_tester
+        run: briefcase package android --format=apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoneCallTester-Android-APK
+          path: android_phone_tester/android/gradle/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: warn
