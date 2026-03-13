@@ -1,0 +1,83 @@
+[project]
+name = "phone_tester"
+version = "1.0.0"
+description = "电话自动拨打测试工具 - Android版"
+author = "Phone Tester Team"
+author_email = "test@example.com"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "toga>=0.4.0",
+    "android-permissions>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "briefcase>=0.3.0",
+]
+
+[project.gui-scripts]
+phone_tester = "phone_tester.app:main"
+
+[build-system]
+requires = ["briefcase==0.3.20"]
+build-backend = "briefcase.build"
+
+[tool.briefcase]
+project_name = "电话拨打测试"
+bundle = "com.example"
+version = "1.0.0"
+url = "https://example.com/phone-tester"
+license.file = "LICENSE"
+author = "Phone Tester Team"
+author_email = "test@example.com"
+
+[tool.briefcase.app.phone_tester]
+formal_name = "电话拨打测试"
+description = "自动电话拨打测试工具，支持双卡、电话拨打、短信发送、Ping测试、结果统计和轨迹记录"
+icon = "src/phone_tester/resources/phone_tester"
+sources = ["src/phone_tester"]
+requires = [
+    "toga>=0.4.0",
+]
+
+test_requires = [
+    "pytest",
+]
+
+[tool.briefcase.app.phone_tester.macOS]
+requires = [
+    "toga-cocoa>=0.4.0",
+    "std-nslog>=1.0.0",
+]
+
+[tool.briefcase.app.phone_tester.linux]
+requires = [
+    "toga-gtk>=0.4.0",
+]
+
+[tool.briefcase.app.phone_tester.windows]
+requires = [
+    "toga-winforms>=0.4.0",
+]
+
+[tool.briefcase.app.phone_tester.android]
+template = "https://github.com/beeware/briefcase-android-gradle-template"
+template_branch = "v0.3.20"
+requires = [
+    "toga-android>=0.4.0",
+]
+
+# Android 权限配置
+[tool.briefcase.app.phone_tester.android.permission]
+CALL_PHONE = "拨打测试电话"
+READ_PHONE_STATE = "读取手机状态和SIM卡信息"
+ACCESS_FINE_LOCATION = "获取精确位置信息"
+ACCESS_COARSE_LOCATION = "获取粗略位置信息"
+INTERNET = "网络访问，用于Ping测试"
+ACCESS_NETWORK_STATE = "检查网络连接状态"
+READ_CALL_LOG = "读取通话记录（用于测试结果验证）"
+SEND_SMS = "发送短信（测试功能）"
+READ_SMS = "读取短信（用于验证发送状态）"
+RECEIVE_SMS = "接收短信（可选功能）"
+WRITE_SMS = "编辑短信（可选功能）"
