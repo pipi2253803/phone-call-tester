@@ -34,67 +34,92 @@ from PyQt6.QtWidgets import (
     QFrame, QProgressBar, QGraphicsDropShadowEffect, QTabWidget,
     QScrollArea, QGridLayout, QTableWidget, QTableWidgetItem
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
 from PyQt6.QtGui import QFont, QColor, QTextCharFormat, QBrush, QIcon, QPalette
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+import folium
+from folium.plugins import MarkerCluster
 
 # 现代化配色方案
+# Windows 风格配色方案 - 更中性的色调
 COLORS = {
-    'primary': '#2196F3',        # 主色调 - 蓝色
-    'primary_dark': '#1976D2',   # 主色调深色
-    'primary_light': '#BBDEFB',  # 主色调浅色
-    'success': '#4CAF50',        # 成功 - 绿色
-    'warning': '#FF9800',        # 警告 - 橙色
-    'error': '#f44336',          # 错误 - 红色
-    'info': '#00BCD4',           # 信息 - 青色
-    'background': '#f0f2f5',     # 背景色
-    'card_bg': '#ffffff',        # 卡片背景
-    'text_primary': '#212121',   # 主要文字
-    'text_secondary': '#757575', # 次要文字
-    'border': '#e0e0e0',         # 边框色
-    'divider': '#eeeeee',        # 分隔线
+    'primary': '#0078D4',        # Windows 蓝
+    'primary_dark': '#005A9E',   # 深蓝色
+    'primary_light': '#E5F1FB',  # 浅蓝背景
+    'success': '#107C10',        # Windows 绿
+    'warning': '#FFB900',        # Windows 黄
+    'error': '#D83B01',          # Windows 红
+    'info': '#0078D4',           # Windows 蓝
+    'background': '#F3F3F3',     # Windows 背景灰
+    'card_bg': '#FFFFFF',        # 纯白卡片
+    'text_primary': '#323130',   # 主要文字 - 深灰
+    'text_secondary': '#605E5C', # 次要文字 - 中灰
+    'border': '#E1DFDD',         # 边框灰
+    'divider': '#EDEBE9',        # 分隔线
 }
 
-# 图标定义
+# Windows 风格图标定义 - 使用文字符号替代 emoji
 ICONS = {
-    'phone': '📱',
-    'call': '📞',
-    'settings': '⚙️',
-    'refresh': '🔄',
-    'start': '▶️',
-    'stop': '⏹️',
-    'save': '💾',
-    'clear': '🗑️',
-    'log': '📋',
-    'device': '📲',
-    'sim': '💳',
-    'signal': '📶',
-    'time': '⏱️',
-    'count': '🔢',
-    'target': '🎯',
-    'check': '✅',
-    'cross': '❌',
-    'warning': '⚠️',
-    'info': 'ℹ️',
-    'success': '✓',
-    'error': '✗',
-    'connected': '🟢',
-    'disconnected': '🔴',
-    'pending': '🟡',
+    'phone': '[电话]',
+    'call': '[拨号]',
+    'settings': '[设置]',
+    'refresh': '[刷新]',
+    'start': '[开始]',
+    'stop': '[停止]',
+    'save': '[保存]',
+    'clear': '[清空]',
+    'log': '[日志]',
+    'device': '[设备]',
+    'sim': '[SIM]',
+    'signal': '[信号]',
+    'time': '[时间]',
+    'count': '[次数]',
+    'target': '[目标]',
+    'check': '[OK]',
+    'cross': '[X]',
+    'warning': '[!]',
+    'info': '[i]',
+    'success': '[v]',
+    'error': '[x]',
+    'connected': '[已连接]',
+    'disconnected': '[未连接]',
+    'pending': '[等待]',
     # 新增图标
-    'script': '📝',
-    'result': '📊',
-    'map': '🗺️',
-    'location': '📍',
-    'run': '▶️',
-    'chart': '📈',
-    'list': '📋',
-    'calendar': '📅',
-    'clock': '🕐',
-    'wifi': '📶',
-    'network': '🌐',
-    'resize': '↔️',
-    'panel': '◫',
+    'script': '[脚本]',
+    'result': '[结果]',
+    'map': '[地图]',
+    'location': '[位置]',
+    'run': '[执行]',
+    'chart': '[图表]',
+    'list': '[列表]',
+    'calendar': '[日期]',
+    'clock': '[时间]',
+    'wifi': '[网络]',
+    'network': '[网络]',
+    'resize': '[调整]',
+    'panel': '[面板]',
 }
+
+# Windows 原生字体设置
+WINDOWS_FONTS = {
+    'ui': 'Segoe UI',           # 主要 UI 字体
+    'ui_zh': 'Microsoft YaHei UI',  # 中文 UI 字体
+    'mono': 'Consolas',         # 等宽字体
+    'mono_zh': 'Microsoft YaHei Mono',  # 中文等宽
+}
+
+def get_font_family() -> str:
+    """获取适合当前平台的字体"""
+    if platform.system() == 'Windows':
+        return f"{WINDOWS_FONTS['ui']}, {WINDOWS_FONTS['ui_zh']}"
+    return "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif"
+
+def get_mono_font() -> str:
+    """获取适合当前平台的等宽字体"""
+    if platform.system() == 'Windows':
+        return f"{WINDOWS_FONTS['mono']}, {WINDOWS_FONTS['ui_zh']}"
+    return "Consolas, Microsoft YaHei, monospace"
 
 
 @dataclass
@@ -162,16 +187,18 @@ class ADBHelper:
         """智能查找ADB路径"""
         # 首先尝试系统PATH中的adb
         try:
-            kwargs = {}
+            startupinfo = None
             if platform.system() == 'Windows':
-                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
             
             result = subprocess.run(
                 ['adb', 'version'],
                 capture_output=True,
                 text=True,
                 timeout=3,
-                **kwargs
+                startupinfo=startupinfo
             )
             if result.returncode == 0:
                 return 'adb'  # 在PATH中直接使用
@@ -208,16 +235,19 @@ class ADBHelper:
             if os.path.isfile(path):
                 # 验证这个adb是否可用
                 try:
-                    kwargs = {}
+                    # Windows 下隐藏控制台窗口
+                    startupinfo = None
                     if platform.system() == 'Windows':
-                        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = subprocess.SW_HIDE
                     
                     result = subprocess.run(
                         [path, 'version'],
                         capture_output=True,
                         text=True,
                         timeout=3,
-                        **kwargs
+                        startupinfo=startupinfo
                     )
                     if result.returncode == 0:
                         return path
@@ -270,9 +300,11 @@ class ADBHelper:
         
         try:
             # Windows 下隐藏控制台窗口
-            kwargs = {}
+            startupinfo = None
             if platform.system() == 'Windows':
-                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
             
             result = subprocess.run(
                 cmd,
@@ -281,7 +313,7 @@ class ADBHelper:
                 timeout=timeout,
                 encoding='utf-8',
                 errors='ignore',
-                **kwargs
+                startupinfo=startupinfo
             )
             result_tuple = (result.returncode == 0, result.stdout, result.stderr)
             
@@ -354,15 +386,16 @@ class ADBHelper:
     
     @classmethod
     def _get_sim_info(cls, serial: str, slot: int) -> SimInfo:
-        """获取指定SIM卡槽的信息"""
+        """获取指定SIM卡槽的信息 - 优化版"""
         sim = SimInfo(slot=slot)
         slot_str = str(slot)
         
-        # SIM卡状态
-        # 尝试不同的属性名
+        # SIM卡状态 - 支持多SIM设备的不同属性名
         state_props = [
+            f'gsm.sim.state.slot{slot}',
+            f'gsm.sim{slot}.state',
             f'gsm.sim.state',
-            f'gsm.sim{slot}.state'
+            f'persist.radio.sim.state',
         ]
         for prop in state_props:
             success, stdout, _ = cls.execute_command(
@@ -387,11 +420,12 @@ class ADBHelper:
                 sim.state = state_map.get(state, state)
                 break
         
-        # 运营商
+        # 运营商 - 支持多SIM设备
         operator_props = [
-            f'gsm.sim.operator.alpha',
+            f'gsm.sim.operator.alpha.slot{slot}',
             f'gsm.sim{slot}.operator.alpha',
-            f'gsm.operator.alpha'
+            f'gsm.sim.operator.alpha',
+            f'gsm.operator.alpha',
         ]
         for prop in operator_props:
             success, stdout, _ = cls.execute_command(
@@ -403,75 +437,196 @@ class ADBHelper:
                     sim.operator = operators[slot].strip()
                 else:
                     sim.operator = operators[0].strip() if operators else 'Unknown'
-                break
-        
-        # 电话号码 - 使用不同的 service call 参数
-        phone_commands = [
-            # 卡一
-            ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo', '13'] if slot == 0 else
-            # 卡二
-            ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo2', '13']
-        ]
-        for cmd in phone_commands:
-            success, stdout, _ = cls.execute_command(cmd)
-            if success:
-                match = re.search(r"'([^']+)'", stdout)
-                if match:
-                    sim.phone_number = match.group(1)
+                if sim.operator and sim.operator != 'Unknown':
                     break
         
-        # 信号强度 - 通过 dumpsys telephony.registry 获取
+        # 电话号码 - 使用多种方法尝试获取
+        phone_number = None
+        
+        # 方法1: iphonesubinfo service
+        service_names = ['iphonesubinfo']
+        if slot == 1:
+            service_names.append('iphonesubinfo2')
+        
+        for service in service_names:
+            cmd = ['adb', '-s', serial, 'shell', 'service', 'call', service, '13']
+            success, stdout, _ = cls.execute_command(cmd, timeout=5)
+            if success and stdout:
+                # 解析返回的 Parcel 数据
+                # 格式类似: Result: Parcel(0x...) 或包含 's16' 和号码
+                match = re.search(r"'(\d+)'", stdout)
+                if match and len(match.group(1)) > 5:
+                    phone_number = match.group(1)
+                    break
+                # 尝试另一种格式
+                lines = stdout.split('\n')
+                for line in lines:
+                    if re.match(r'^\d{11}$', line.strip()):
+                        phone_number = line.strip()
+                        break
+        
+        # 方法2: 使用 telephony 数据库查询（部分设备支持）
+        if not phone_number:
+            cmd = ['adb', '-s', serial, 'shell', 'content', 'query', 
+                   '--uri', f'content://telephony/siminfo/{slot+1}']
+            success, stdout, _ = cls.execute_command(cmd, timeout=5)
+            if success and stdout:
+                match = re.search(r'number=(\d+)', stdout)
+                if match:
+                    phone_number = match.group(1)
+        
+        # 方法3: 从 SIM 卡信息中获取
+        if not phone_number:
+            cmd = ['adb', '-s', serial, 'shell', 'getprop', f'gsm.sim.msisdn.slot{slot}']
+            success, stdout, _ = cls.execute_command(cmd)
+            if success and stdout.strip():
+                phone_number = stdout.strip()
+        
+        sim.phone_number = phone_number if phone_number else "未知"
+        
+        # 信号强度 - 改进的信号读取
+        signal_level = -1
+        
+        # 方法1: dumpsys telephony.registry
         success, stdout, _ = cls.execute_command(
-            ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry']
+            ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry'],
+            timeout=5
         )
-        if success:
-            # 尝试获取信号强度
-            # 寻找 mSignalStrength 或类似字段
-            signal_patterns = [
-                rf'mSignalStrength\[slot={slot}\].*level=(\d+)',
+        if success and stdout:
+            # 针对 slot 的匹配
+            patterns = [
+                rf'CellSignalStrength[^\n]*{{[^}}]*mLevel=(\d+)[^}}]*slot={slot}',
+                rf'CellSignalStrength[^\n]*slot={slot}[^\n]*mLevel=(\d+)',
+                rf'mSignalStrength[^\n]*slot={slot}[^\n]*level[:=](\d+)',
+                rf'\[slot={slot}\][^\n]*CellSignalStrength[^\n]*level[:=](\d+)',
+                # 更宽松的匹配
                 rf'mSignalStrength.*?level=(\d+)',
+                rf'level[:=]\s*(\d+)',
             ]
-            for pattern in signal_patterns:
-                match = re.search(pattern, stdout)
+            for pattern in patterns:
+                match = re.search(pattern, stdout, re.DOTALL)
                 if match:
                     try:
                         level = int(match.group(1))
-                        sim.signal_level = min(max(level, 0), 4)  # 限制在0-4范围
+                        if 0 <= level <= 4:
+                            signal_level = level
+                            break
                     except:
                         pass
-                    break
         
-        # 网络类型
-        success, stdout, _ = cls.execute_command(
-            ['adb', '-s', serial, 'shell', 'getprop', 'gsm.network.type']
-        )
-        if success and stdout.strip():
-            types = stdout.strip().split(',')
-            if slot < len(types):
-                network = types[slot].strip()
-                # 简化网络类型显示
+        # 方法2: 通过 settings 获取
+        if signal_level < 0:
+            cmd = ['adb', '-s', serial, 'shell', 'settings', 'get', 'global', 
+                   f'mobile_data_signal_strength_slot_{slot}']
+            success, stdout, _ = cls.execute_command(cmd, timeout=3)
+            if success and stdout.strip():
+                try:
+                    signal_level = int(stdout.strip())
+                except:
+                    pass
+        
+        sim.signal_level = signal_level if signal_level >= 0 else 0
+        
+        # 网络类型 - 支持多SIM
+        network_type = 'Unknown'
+        network_props = [
+            f'gsm.network.type.slot{slot}',
+            f'gsm.network.type',
+            f'gsm.operator.network.type',
+        ]
+        for prop in network_props:
+            success, stdout, _ = cls.execute_command(
+                ['adb', '-s', serial, 'shell', 'getprop', prop]
+            )
+            if success and stdout.strip():
+                types = stdout.strip().split(',')
+                if slot < len(types):
+                    network = types[slot].strip()
+                else:
+                    network = types[0].strip() if types else 'Unknown'
+                
                 network_map = {
                     'LTE': '4G',
                     'NR': '5G',
+                    'NSA': '5G',
                     'UMTS': '3G',
+                    'HSPA': '3G',
+                    'HSPAP': '3G',
                     'EDGE': '2G',
                     'GPRS': '2G',
+                    'CDMA': '2G',
                 }
-                sim.network_type = network_map.get(network, network)
+                network_type = network_map.get(network, network)
+                if network_type != 'Unknown':
+                    break
         
+        sim.network_type = network_type
         return sim
     
     @classmethod
-    def make_call(cls, serial: str, phone_number: str) -> bool:
-        """拨打电话"""
-        # 使用tel URI格式拨打电话
-        cmd = [
-            'adb', '-s', serial, 'shell', 'am', 'start',
-            '-a', 'android.intent.action.CALL',
-            '-d', f'tel:{phone_number}'
-        ]
-        success, _, _ = cls.execute_command(cmd)
-        return success
+    def make_call(cls, serial: str, phone_number: str, sim_slot: int = 0) -> bool:
+        """拨打电话 - 使用service call直接拨号"""
+        import time
+        
+        # 清除可能存在的旧通话状态
+        cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_ENDCALL'], timeout=2)
+        time.sleep(0.5)
+        
+        # 方法1: 使用 service call phone 直接拨号（最可靠）
+        # 2 表示 CALL 操作，s16 表示字符串参数
+        try:
+            cmd = ['adb', '-s', serial, 'shell', 'service', 'call', 'phone', '2', 's16', phone_number]
+            success, stdout, stderr = cls.execute_command(cmd, timeout=5)
+            if success and ('Parcel' in stdout or 'Result' in stdout):
+                # 等待一下确保拨号已发起
+                time.sleep(1)
+                return True
+        except Exception as e:
+            print(f"service call phone 失败: {e}")
+        
+        # 方法2: 使用 am start 打开拨号界面并模拟点击
+        try:
+            # 先打开拨号界面
+            cmd = [
+                'adb', '-s', serial, 'shell', 'am', 'start',
+                '-a', 'android.intent.action.DIAL',
+                '-d', f'tel:{phone_number}'
+            ]
+            cls.execute_command(cmd, timeout=5)
+            time.sleep(1)
+            
+            # 模拟点击拨号键（坐标可能因设备而异，尝试几种常见方案）
+            # 方案A: 使用 keyevent
+            cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_CALL'], timeout=2)
+            time.sleep(0.5)
+            
+            return True
+        except Exception as e:
+            print(f"备选拨号方案失败: {e}")
+        
+        # 方法3: 使用 input text 和 keyevent（某些设备有效）
+        try:
+            # 直接通过 keyevent 序列拨号
+            for digit in phone_number:
+                if digit.isdigit():
+                    keycode = f"KEYCODE_{digit}"
+                    cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', keycode], timeout=1)
+                    time.sleep(0.1)
+                elif digit == '*':
+                    cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_STAR'], timeout=1)
+                    time.sleep(0.1)
+                elif digit == '#':
+                    cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_POUND'], timeout=1)
+                    time.sleep(0.1)
+            
+            # 按拨号键
+            time.sleep(0.5)
+            cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_CALL'], timeout=2)
+            return True
+        except Exception as e:
+            print(f"KeyEvent拨号失败: {e}")
+        
+        return False
     
     @classmethod
     def end_call(cls, serial: str) -> bool:
@@ -674,7 +829,9 @@ class CallWorker(QThread):
             
             # 拨打电话
             self.log_signal.emit(f"正在拨打: {self.phone_number}", "info")
-            call_success = ADBHelper.make_call(self.serial, self.phone_number)
+            # 将 sim_card 字符串转换为 slot 数字
+            sim_slot = 0 if self.sim_card == "卡一" else 1
+            call_success = ADBHelper.make_call(self.serial, self.phone_number, sim_slot)
             
             if not call_success:
                 self.log_signal.emit("拨打电话失败！", "error")
@@ -1090,7 +1247,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{ICONS['phone']} Android电话自动拨打测试工具")
+        
+        # 设置窗口大小和最小尺寸（确保可以调整大小）
         self.setGeometry(100, 100, 1300, 850)
+        self.setMinimumSize(1000, 700)  # 最小尺寸
+        
+        # 确保窗口可以调整大小
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
         
         self.current_device: Optional[DeviceInfo] = None
         self.call_worker: Optional[CallWorker] = None
@@ -1155,15 +1318,15 @@ class MainWindow(QMainWindow):
         """)
         main_layout.addWidget(splitter)
         
-        # 左侧控制面板
+        # 左侧控制面板 - 使用滚动区域，设置合理的尺寸限制
         left_panel = self.create_left_panel()
-        left_panel.setMinimumWidth(350)  # 最小宽度限制
-        left_panel.setMaximumWidth(600)  # 最大宽度限制
+        left_panel.setMinimumWidth(320)   # 减小最小宽度
+        left_panel.setMaximumWidth(550)   # 限制最大宽度但不要过窄
         splitter.addWidget(left_panel)
         
-        # 右侧日志面板
+        # 右侧日志面板 - 自适应填充剩余空间
         right_panel = self.create_right_panel()
-        right_panel.setMinimumWidth(400)  # 最小宽度限制
+        right_panel.setMinimumWidth(300)  # 减小最小宽度，允许更灵活调整
         splitter.addWidget(right_panel)
         
         # 设置分割器比例 (左:右 = 1:2)
@@ -1208,9 +1371,59 @@ class MainWindow(QMainWindow):
         """)
         self.progress_bar.hide()
         self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        # 添加版权信息
+        copyright_label = QLabel("  © 2026 OTC GROUP  ")
+        copyright_label.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['text_secondary']};
+                font-size: 11px;
+                padding: 0 8px;
+            }}
+        """)
+        self.status_bar.addPermanentWidget(copyright_label)
+        
+        # 添加联系信息（小字，鼠标悬停显示）
+        contact_label = QLabel("  Contact: Tianyuan.liu@samsung.com  ")
+        contact_label.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['text_secondary']};
+                font-size: 9px;
+                padding: 0 4px;
+            }}
+        """)
+        contact_label.setToolTip("For technical support and usage inquiries")
+        self.status_bar.addPermanentWidget(contact_label)
     
     def create_left_panel(self) -> QWidget:
-        """创建左侧控制面板"""
+        """创建左侧控制面板 - 使用滚动区域包装以适应不同窗口大小"""
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background-color: #f0f0f0;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #c0c0c0;
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #a0a0a0;
+            }
+        """)
+        
+        # 创建实际的内容面板
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setSpacing(16)
@@ -1225,10 +1438,10 @@ class MainWindow(QMainWindow):
         # 卡片标题
         title_layout = QHBoxLayout()
         title_icon = QLabel(ICONS['device'])
-        title_icon.setStyleSheet("font-size: 24px;")
+        title_icon.setStyleSheet("")
         title_layout.addWidget(title_icon)
         title_label = QLabel("设备连接")
-        title_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         title_label.setStyleSheet(f"color: {COLORS['text_primary']};")
         title_layout.addWidget(title_label)
         title_layout.addStretch()
@@ -1323,10 +1536,10 @@ class MainWindow(QMainWindow):
         # 标题
         phone_title_layout = QHBoxLayout()
         phone_icon = QLabel(ICONS['phone'])
-        phone_icon.setStyleSheet("font-size: 24px;")
+        phone_icon.setStyleSheet("")
         phone_title_layout.addWidget(phone_icon)
         phone_title = QLabel("手机信息")
-        phone_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        phone_title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         phone_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         phone_title_layout.addWidget(phone_title)
         phone_title_layout.addStretch()
@@ -1371,19 +1584,19 @@ class MainWindow(QMainWindow):
         phone_info_layout.addLayout(info_grid)
         layout.addWidget(phone_info_card)
         
-        # ===== 双卡信息卡片 =====
+        # ===== 双卡信息卡片 - 横向并排布局 =====
         sim_card = CardFrame()
         sim_layout = QVBoxLayout(sim_card)
-        sim_layout.setSpacing(16)
-        sim_layout.setContentsMargins(20, 20, 20, 20)
+        sim_layout.setSpacing(12)
+        sim_layout.setContentsMargins(16, 16, 16, 16)
         
         # 标题
         sim_title_layout = QHBoxLayout()
         sim_icon = QLabel(ICONS['sim'])
-        sim_icon.setStyleSheet("font-size: 24px;")
+        sim_icon.setStyleSheet("")
         sim_title_layout.addWidget(sim_icon)
         sim_title = QLabel("双卡状态")
-        sim_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        sim_title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         sim_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         sim_title_layout.addWidget(sim_title)
         sim_title_layout.addStretch()
@@ -1395,14 +1608,19 @@ class MainWindow(QMainWindow):
         line3.setStyleSheet(f"background-color: {COLORS['divider']}; max-height: 1px;")
         sim_layout.addWidget(line3)
         
+        # 双卡横向并排
+        sims_layout = QHBoxLayout()
+        sims_layout.setSpacing(12)
+        
         # 卡一信息
-        sim1_frame = self._create_sim_info_frame("卡一", "sim1")
-        sim_layout.addWidget(sim1_frame)
+        sim1_frame = self._create_sim_info_frame_compact("卡一", "sim1")
+        sims_layout.addWidget(sim1_frame, 1)
         
         # 卡二信息
-        sim2_frame = self._create_sim_info_frame("卡二", "sim2")
-        sim_layout.addWidget(sim2_frame)
+        sim2_frame = self._create_sim_info_frame_compact("卡二", "sim2")
+        sims_layout.addWidget(sim2_frame, 1)
         
+        sim_layout.addLayout(sims_layout)
         layout.addWidget(sim_card)
         
         # ===== 实时状态卡片 =====
@@ -1414,10 +1632,10 @@ class MainWindow(QMainWindow):
         # 标题
         status_title_layout = QHBoxLayout()
         status_icon = QLabel(ICONS['time'])
-        status_icon.setStyleSheet("font-size: 24px;")
+        status_icon.setStyleSheet("")
         status_title_layout.addWidget(status_icon)
         status_title = QLabel("实时状态")
-        status_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        status_title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         status_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         status_title_layout.addWidget(status_title)
         status_title_layout.addStretch()
@@ -1491,10 +1709,10 @@ class MainWindow(QMainWindow):
         # 标题
         control_title_layout = QHBoxLayout()
         control_icon = QLabel(ICONS['call'])
-        control_icon.setStyleSheet("font-size: 24px;")
+        control_icon.setStyleSheet("")
         control_title_layout.addWidget(control_icon)
         control_title = QLabel("快速控制")
-        control_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        control_title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         control_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         control_title_layout.addWidget(control_title)
         control_title_layout.addStretch()
@@ -1511,13 +1729,13 @@ class MainWindow(QMainWindow):
         
         self.start_btn = IconButton(ICONS['start'], "开始", COLORS['success'])
         self.start_btn.setMinimumHeight(45)
-        self.start_btn.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+        self.start_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         self.start_btn.clicked.connect(self.start_calling)
         btn_layout.addWidget(self.start_btn)
         
         self.stop_btn = IconButton(ICONS['stop'], "停止", COLORS['error'])
         self.stop_btn.setMinimumHeight(45)
-        self.stop_btn.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+        self.stop_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         self.stop_btn.clicked.connect(self.stop_calling)
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
@@ -1533,103 +1751,104 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(control_card)
         
-        # 添加弹性空间
+        # 添加弹性空间，让内容可以压缩
         layout.addStretch()
         
         # 启动时钟更新
         self._start_clock()
         
-        return panel
+        # 将面板放入滚动区域
+        scroll_area.setWidget(panel)
+        return scroll_area
     
-    def _create_sim_info_frame(self, sim_name: str, sim_id: str) -> CardFrame:
-        """创建SIM卡信息展示框架（原始版本）"""
+    def _create_sim_info_frame_compact(self, sim_name: str, sim_id: str) -> CardFrame:
+        """创建紧凑的SIM卡信息展示框架 - 横向并排优化"""
         frame = CardFrame()
         layout = QVBoxLayout(frame)
-        layout.setSpacing(10)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
         
-        # 标题行
+        # 标题行 - SIM卡名称和状态
         header = QHBoxLayout()
-        
-        # SIM卡图标和名称
         sim_title = QLabel(f"{ICONS['sim']} {sim_name}")
-        sim_title.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+        sim_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         sim_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         header.addWidget(sim_title)
-        
         header.addStretch()
         
-        # 状态指示
         status_badge = StatusBadge("未插入", "default")
+        status_badge.setStyleSheet(status_badge.styleSheet().replace("padding: 4px 10px", "padding: 2px 8px"))
         setattr(self, f"{sim_id}_status_badge", status_badge)
         header.addWidget(status_badge)
-        
         layout.addLayout(header)
         
-        # 信息网格
-        info_grid = QGridLayout()
-        info_grid.setSpacing(8)
-        
-        # 运营商
-        info_grid.addWidget(QLabel(f"{ICONS['signal']} 运营商:"), 0, 0)
-        operator_label = QLabel("--")
-        operator_label.setStyleSheet(f"""
+        # 信息区域 - 垂直紧凑排列
+        info_style = f"""
             QLabel {{
-                padding: 6px 10px;
+                padding: 4px 8px;
                 background-color: {COLORS['background']};
                 border-radius: 4px;
                 color: {COLORS['text_primary']};
-                font-size: 12px;
+                font-size: 11px;
             }}
-        """)
-        setattr(self, f"{sim_id}_operator_label", operator_label)
-        info_grid.addWidget(operator_label, 0, 1)
+        """
         
-        # 手机号码
-        info_grid.addWidget(QLabel(f"{ICONS['call']} 手机号:"), 1, 0)
+        # 运营商
+        op_layout = QHBoxLayout()
+        op_layout.addWidget(QLabel(f"{ICONS['signal']} 运营商"))
+        operator_label = QLabel("--")
+        operator_label.setStyleSheet(info_style)
+        operator_label.setMinimumWidth(80)
+        setattr(self, f"{sim_id}_operator_label", operator_label)
+        op_layout.addWidget(operator_label, 1)
+        layout.addLayout(op_layout)
+        
+        # 手机号
+        num_layout = QHBoxLayout()
+        num_layout.addWidget(QLabel(f"{ICONS['call']} 号码"))
         number_label = QLabel("--")
-        number_label.setStyleSheet(operator_label.styleSheet())
+        number_label.setStyleSheet(info_style)
+        number_label.setMinimumWidth(80)
         setattr(self, f"{sim_id}_number_label", number_label)
-        info_grid.addWidget(number_label, 1, 1)
+        num_layout.addWidget(number_label, 1)
+        layout.addLayout(num_layout)
         
         # 信号强度
-        info_grid.addWidget(QLabel(f"{ICONS['wifi']} 信号强度:"), 2, 0)
+        sig_layout = QHBoxLayout()
+        sig_layout.addWidget(QLabel(f"{ICONS['wifi']} 信号"))
+        
         signal_frame = QFrame()
         signal_layout = QHBoxLayout(signal_frame)
-        signal_layout.setSpacing(4)
+        signal_layout.setSpacing(2)
         signal_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 信号条
         signal_bars = []
         for i in range(4):
             bar = QFrame()
-            bar.setFixedSize(6, 10 + i * 4)
-            bar.setStyleSheet(f"""
-                QFrame {{
-                    background-color: {COLORS['divider']};
-                    border-radius: 2px;
-                }}
-            """)
+            bar.setFixedSize(4, 8 + i * 3)
+            bar.setStyleSheet(f"background-color: {COLORS['divider']}; border-radius: 1px;")
             signal_layout.addWidget(bar)
             signal_bars.append(bar)
         setattr(self, f"{sim_id}_signal_bars", signal_bars)
         
-        signal_value = QLabel("无信号")
-        signal_value.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        signal_value = QLabel("无")
+        signal_value.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10px;")
         setattr(self, f"{sim_id}_signal_value", signal_value)
         signal_layout.addWidget(signal_value)
         signal_layout.addStretch()
         
-        info_grid.addWidget(signal_frame, 2, 1)
+        sig_layout.addWidget(signal_frame)
+        layout.addLayout(sig_layout)
         
         # 网络类型
-        info_grid.addWidget(QLabel(f"{ICONS['network']} 网络类型:"), 3, 0)
+        net_layout = QHBoxLayout()
+        net_layout.addWidget(QLabel(f"{ICONS['network']} 网络"))
         network_label = QLabel("--")
-        network_label.setStyleSheet(operator_label.styleSheet())
+        network_label.setStyleSheet(info_style)
+        network_label.setMinimumWidth(50)
         setattr(self, f"{sim_id}_network_label", network_label)
-        info_grid.addWidget(network_label, 3, 1)
-        
-        layout.addLayout(info_grid)
+        net_layout.addWidget(network_label, 1)
+        layout.addLayout(net_layout)
         
         return frame
 
@@ -1650,15 +1869,19 @@ class MainWindow(QMainWindow):
         update_clock()  # 立即更新一次
     
     def create_right_panel(self) -> QWidget:
-        """创建右侧 Tab 面板"""
+        """创建右侧 Tab 面板 - 自适应布局"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
         
-        # 创建 Tab 控件
+        # 创建 Tab 控件，设置自适应
         self.tab_widget = QTabWidget()
         self.tab_widget.setDocumentMode(True)
+        self.tab_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding
+        )
         self.tab_widget.setStyleSheet(f"""
             QTabWidget::pane {{
                 border: 1px solid {COLORS['border']};
@@ -1710,7 +1933,8 @@ class MainWindow(QMainWindow):
         # 默认选中"运行日志"标签
         self.tab_widget.setCurrentIndex(1)
         
-        layout.addWidget(self.tab_widget)
+        # TabWidget 填充所有可用空间
+        layout.addWidget(self.tab_widget, 1)  # stretch factor = 1
         return panel
     
     def _create_script_tab(self) -> QWidget:
@@ -1723,7 +1947,7 @@ class MainWindow(QMainWindow):
         # 标题栏
         header = QHBoxLayout()
         title = QLabel(f"{ICONS['script']} 双卡拨打策略配置")
-        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         header.addWidget(title)
         
@@ -1757,7 +1981,7 @@ class MainWindow(QMainWindow):
         target_layout.setContentsMargins(16, 16, 16, 16)
         
         target_title = QLabel(f"{ICONS['target']} 目标手机设置")
-        target_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        target_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         target_layout.addWidget(target_title)
         
         target_form = QHBoxLayout()
@@ -1795,7 +2019,7 @@ class MainWindow(QMainWindow):
         strategy_layout.setContentsMargins(16, 16, 16, 16)
         
         strategy_title = QLabel(f"{ICONS['settings']} 添加测试策略")
-        strategy_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        strategy_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         strategy_layout.addWidget(strategy_title)
         
         # 测试类型选择
@@ -1958,7 +2182,7 @@ class MainWindow(QMainWindow):
         
         # 策略列表区域
         list_title = QLabel(f"{ICONS['list']} 策略列表 (将按顺序执行)")
-        list_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        list_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         layout.addWidget(list_title)
         
         # 策略列表容器
@@ -1980,7 +2204,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid {COLORS['border']};
             }}
         """)
-        layout.addWidget(scroll)
+        # 策略列表填充剩余空间
+        layout.addWidget(scroll, 1)  # stretch factor = 1
         
         # 底部统计和操作
         bottom_layout = QHBoxLayout()
@@ -2109,7 +2334,7 @@ class MainWindow(QMainWindow):
         
         # 序号
         num_label = QLabel(f"#{index + 1}")
-        num_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        num_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         num_label.setStyleSheet(f"color: {COLORS['primary']}; min-width: 30px;")
         layout.addWidget(num_label)
         
@@ -2123,7 +2348,7 @@ class MainWindow(QMainWindow):
         
         desc_text = f"{test_type_icon} {sim_icon} {strategy['local_sim']} ➜ {target_icon} {strategy['target']}"
         desc = QLabel(desc_text)
-        desc.setFont(QFont("Arial", 12))
+        desc.setFont(QFont("Segoe UI", 12))
         desc.setStyleSheet(f"color: {COLORS['text_primary']}; min-width: 200px;")
         layout.addWidget(desc)
         
@@ -2215,7 +2440,7 @@ class MainWindow(QMainWindow):
         title_bar = QHBoxLayout()
         
         title = QLabel(f"{ICONS['log']} 运行日志")
-        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         title_bar.addWidget(title)
         
@@ -2293,7 +2518,8 @@ class MainWindow(QMainWindow):
                 background-color: #6c7086;
             }}
         """)
-        layout.addWidget(self.log_text)
+        # 日志文本框填充剩余空间
+        layout.addWidget(self.log_text, 1)  # stretch factor = 1
         
         # 日志操作按钮
         btn_layout = QHBoxLayout()
@@ -2333,7 +2559,7 @@ class MainWindow(QMainWindow):
         # 标题栏
         header = QHBoxLayout()
         title = QLabel(f"{ICONS['result']} 测试结果统计")
-        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         header.addWidget(title)
         header.addStretch()
@@ -2411,7 +2637,8 @@ class MainWindow(QMainWindow):
         self.result_table.setColumnWidth(5, 100)  # 通话结果
         self.result_table.setColumnWidth(6, 120)  # 信号状态
         
-        layout.addWidget(self.result_table)
+        # 表格填充剩余空间
+        layout.addWidget(self.result_table, 1)  # stretch factor = 1
         
         # 底部操作按钮
         btn_layout = QHBoxLayout()
@@ -2620,7 +2847,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", f"导出时发生错误：\n{str(e)}")
     
     def _create_map_tab(self) -> QWidget:
-        """创建地图打点 Tab - 实现通话位置记录"""
+        """创建地图打点 Tab - 使用 Folium + WebEngine 实现真实地图"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -2629,7 +2856,7 @@ class MainWindow(QMainWindow):
         # 标题栏
         header = QHBoxLayout()
         title = QLabel(f"{ICONS['map']} 通话位置地图")
-        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         header.addWidget(title)
         header.addStretch()
@@ -2650,24 +2877,18 @@ class MainWindow(QMainWindow):
         line.setStyleSheet(f"background-color: {COLORS['divider']}; max-height: 1px;")
         layout.addWidget(line)
         
-        # 简化的位置画布
-        self.map_canvas = QTextEdit()
-        self.map_canvas.setReadOnly(True)
-        self.map_canvas.setMinimumHeight(200)
-        self.map_canvas.setPlaceholderText("位置地图将在这里显示...\n\n每次电话接通时会自动记录位置")
-        self.map_canvas.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: #f0f4f8;
-                color: {COLORS['text_primary']};
+        # 真实地图 - 使用 QWebEngineView 加载 Folium 地图
+        self.map_view = QWebEngineView()
+        self.map_view.setMinimumHeight(300)
+        self.map_view.setStyleSheet(f"""
+            QWebEngineView {{
                 border: 2px solid {COLORS['border']};
                 border-radius: 12px;
-                padding: 16px;
-                font-family: 'Consolas', monospace;
-                font-size: 11px;
-                line-height: 1.6;
             }}
         """)
-        layout.addWidget(self.map_canvas)
+        # 初始化空白地图
+        self._init_empty_map()
+        layout.addWidget(self.map_view, 1)  # stretch factor = 1
         
         # 当前位置信息
         self.current_location_display = QLabel(f"{ICONS['location']} 当前位置: 等待记录...")
@@ -2682,10 +2903,10 @@ class MainWindow(QMainWindow):
         """)
         layout.addWidget(self.current_location_display)
         
-        # 位置列表
+        # 位置列表（文本形式补充）
         self.location_list = QTextEdit()
         self.location_list.setReadOnly(True)
-        self.location_list.setMaximumHeight(150)
+        self.location_list.setMaximumHeight(120)
         self.location_list.setPlaceholderText("通话位置记录将显示在这里...")
         self.location_list.setStyleSheet(f"""
             QTextEdit {{
@@ -2742,30 +2963,53 @@ class MainWindow(QMainWindow):
         self.current_location_display.setText(f"{ICONS['location']} {location}")
     
     def _get_device_location(self) -> str:
-        """获取设备位置信息"""
+        """获取设备位置信息 - 优先获取GPS坐标"""
         if not self.current_device:
             return "未连接设备"
         try:
-            # 尝试获取GPS位置
+            # 方法1: 尝试获取GPS位置（最准确）
             success, stdout, _ = ADBHelper.execute_command(
                 ['adb', '-s', self.current_device.serial, 'shell', 'dumpsys', 'location'],
                 timeout=5
             )
             if success and stdout:
                 lines = stdout.strip().split('\n')
-                for line in lines[:20]:
-                    if 'latitude' in line.lower() or 'longitude' in line.lower():
-                        return line.strip()[:60]
-            # 尝试获取基站信息
+                for line in lines:
+                    line_lower = line.lower()
+                    # 查找包含经纬度的行
+                    if ('latitude' in line_lower and 'longitude' in line_lower) or \
+                       ('lat=' in line_lower and 'lon=' in line_lower):
+                        # 尝试提取坐标
+                        import re
+                        lat_match = re.search(r'lat(?:itude)?[=:]\s*(-?\d+\.\d+)', line, re.I)
+                        lon_match = re.search(r'lon(?:gitude)?[=:]\s*(-?\d+\.\d+)', line, re.I)
+                        if lat_match and lon_match:
+                            lat = float(lat_match.group(1))
+                            lon = float(lon_match.group(1))
+                            return f"lat={lat},lon={lon}"
+                        return line.strip()[:80]
+            
+            # 方法2: 使用 settings 获取最后已知位置
+            success, stdout, _ = ADBHelper.execute_command(
+                ['adb', '-s', self.current_device.serial, 'shell', 'settings', 'get', 'secure', 'location_providers_allowed'],
+                timeout=3
+            )
+            if success and 'gps' in stdout.lower():
+                # GPS已启用，尝试获取更精确位置
+                pass
+            
+            # 方法3: 尝试获取基站位置（粗略）
             success, stdout, _ = ADBHelper.execute_command(
                 ['adb', '-s', self.current_device.serial, 'shell', 'dumpsys', 'telephony.registry'],
                 timeout=5
             )
             if success and stdout:
                 lines = stdout.strip().split('\n')
-                for line in lines[:10]:
-                    if 'mCellIdentity' in line or 'mSignalStrength' in line:
-                        return f"基站: {line.strip()[:50]}"
+                for line in lines:
+                    if 'mCellIdentity' in line:
+                        # 提取基站信息
+                        return f"cell:{line.strip()[:60]}"
+            
             return "位置信息暂时不可用"
         except Exception as e:
             return f"获取失败: {str(e)[:30]}"
@@ -2795,27 +3039,133 @@ class MainWindow(QMainWindow):
         self.location_status.setText("已记录")
         self.location_status.set_status("success")
     
+    def _init_empty_map(self):
+        """初始化空白地图"""
+        # 创建以北京为中心的地图
+        m = folium.Map(
+            location=[39.9042, 116.4074],
+            zoom_start=12,
+            tiles='OpenStreetMap'
+        )
+        
+        # 添加提示标记
+        folium.Marker(
+            [39.9042, 116.4074],
+            popup='等待通话位置记录...',
+            icon=folium.Icon(color='gray', icon='info-sign')
+        ).add_to(m)
+        
+        # 保存并加载
+        self._load_map_to_view(m)
+    
+    def _load_map_to_view(self, map_obj: folium.Map):
+        """将 Folium 地图加载到 QWebEngineView"""
+        import tempfile
+        import os
+        
+        # 创建临时文件
+        temp_dir = tempfile.gettempdir()
+        map_path = os.path.join(temp_dir, 'phone_tester_map.html')
+        map_obj.save(map_path)
+        
+        # 加载到视图
+        self.map_view.load(QUrl.fromLocalFile(map_path))
+    
     def _update_location_display(self):
-        """更新位置地图显示"""
+        """更新位置地图显示 - 使用真实地图"""
         if not self.location_records:
+            self._init_empty_map()
             return
-        map_text = "📍 通话位置分布图\n"
-        map_text += "=" * 50 + "\n\n"
-        for i, record in enumerate(self.location_records[-10:], 1):
-            map_text += f"  通话 #{record['call_index']}/{record['total_calls']}\n"
-            map_text += f"  📱 {record['phone_number']}\n"
-            map_text += f"  🕐 {record['timestamp']}\n"
-            map_text += f"  📍 {record['location'][:35]}...\n"
-            map_text += "  ─" * 20 + "\n\n"
-        if len(self.location_records) > 10:
-            map_text += f"  ... 还有 {len(self.location_records) - 10} 条记录 ...\n"
-        self.map_canvas.setText(map_text)
+        
+        # 解析所有记录的位置坐标
+        valid_coords = []
+        for record in self.location_records:
+            coords = self._parse_location_coords(record['location'])
+            if coords:
+                valid_coords.append({
+                    'lat': coords[0],
+                    'lng': coords[1],
+                    'phone': record['phone_number'],
+                    'time': record['timestamp'],
+                    'index': record['call_index']
+                })
+        
+        if not valid_coords:
+            # 没有有效坐标，显示空白地图
+            self._init_empty_map()
+            return
+        
+        # 创建地图，中心点为第一个有效位置
+        center_lat = valid_coords[0]['lat']
+        center_lng = valid_coords[0]['lng']
+        
+        m = folium.Map(
+            location=[center_lat, center_lng],
+            zoom_start=15,
+            tiles='OpenStreetMap'
+        )
+        
+        # 添加标记点
+        for i, coord in enumerate(valid_coords):
+            # 根据索引选择颜色
+            colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'darkblue', 'darkgreen']
+            color = colors[i % len(colors)]
+            
+            folium.Marker(
+                [coord['lat'], coord['lng']],
+                popup=f"通话 #{coord['index']}<br>号码: {coord['phone']}<br>时间: {coord['time']}",
+                tooltip=f"通话 #{coord['index']}",
+                icon=folium.Icon(color=color, icon='phone', prefix='fa')
+            ).add_to(m)
+        
+        # 如果有多个点，添加连线
+        if len(valid_coords) > 1:
+            points = [[c['lat'], c['lng']] for c in valid_coords]
+            folium.PolyLine(
+                points,
+                color='#2196F3',
+                weight=3,
+                opacity=0.7,
+                dash_array='5, 10'
+            ).add_to(m)
+        
+        # 适应边界
+        if len(valid_coords) > 1:
+            m.fit_bounds([[c['lat'], c['lng']] for c in valid_coords], padding=[50, 50])
+        
+        # 加载地图
+        self._load_map_to_view(m)
+    
+    def _parse_location_coords(self, location_str: str) -> tuple:
+        """从位置字符串解析经纬度"""
+        import re
+        
+        # 尝试匹配各种经纬度格式
+        # 格式1: lat=39.9, lon=116.4
+        match = re.search(r'lat[=:]\s*(-?\d+\.?\d*)[\s,;]+lon[=:]\s*(-?\d+\.?\d*)', location_str, re.I)
+        if match:
+            return (float(match.group(1)), float(match.group(2)))
+        
+        # 格式2: latitude: 39.9, longitude: 116.4
+        match = re.search(r'latitude[=:]\s*(-?\d+\.?\d*)[\s,;]+longitude[=:]\s*(-?\d+\.?\d*)', location_str, re.I)
+        if match:
+            return (float(match.group(1)), float(match.group(2)))
+        
+        # 格式3: 39.9042,116.4074 (纯数字对)
+        match = re.search(r'(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)', location_str)
+        if match:
+            lat, lng = float(match.group(1)), float(match.group(2))
+            # 验证范围（中国大致范围）
+            if 3 <= lat <= 54 and 73 <= lng <= 135:
+                return (lat, lng)
+        
+        return None
     
     def _clear_location_records(self):
         """清空位置记录"""
         self.location_records.clear()
         self.location_list.clear()
-        self.map_canvas.clear()
+        self._init_empty_map()
         self.location_count_label.setText("通话记录: 0")
         self.location_status.setText("未定位")
         self.location_status.set_status("default")
@@ -2861,11 +3211,11 @@ class MainWindow(QMainWindow):
         # 标题栏
         title_layout = QHBoxLayout()
         title_icon = QLabel("🖥️")
-        title_icon.setStyleSheet("font-size: 24px;")
+        title_icon.setStyleSheet("")
         title_layout.addWidget(title_icon)
         
         title_label = QLabel("ADB 命令终端")
-        title_label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         title_label.setStyleSheet(f"color: {COLORS['text_primary']};")
         title_layout.addWidget(title_label)
         title_layout.addStretch()
@@ -2910,7 +3260,8 @@ class MainWindow(QMainWindow):
                 background-color: #6c7086;
             }}
         """)
-        layout.addWidget(self.adb_output)
+        # 终端输出区域填充空间
+        layout.addWidget(self.adb_output, 1)  # stretch factor = 1
         
         # 命令输入区域
         input_layout = QHBoxLayout()
@@ -3254,13 +3605,13 @@ class MainWindow(QMainWindow):
         
         # 图标和标题
         header = QLabel(f"{icon} {title}")
-        header.setFont(QFont("Arial", 12))
+        header.setFont(QFont("Segoe UI", 12))
         header.setStyleSheet(f"color: {COLORS['text_secondary']};")
         layout.addWidget(header)
         
         # 数值
         value_label = QLabel(value)
-        value_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        value_label.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
         value_label.setStyleSheet(f"color: {color};")
         layout.addWidget(value_label)
         
@@ -3880,30 +4231,96 @@ def main():
         # macOS/Linux 使用 Fusion 风格
         app.setStyle('Fusion')
     
-    # 设置应用程序全局样式
+    # 设置应用程序全局样式 - Windows 原生风格
+    font_family = get_font_family()
     app.setStyleSheet(f"""
         QMainWindow {{
             background-color: {COLORS['background']};
         }}
         QWidget {{
-            font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            font-family: {font_family};
+            font-size: 9pt;
+        }}
+        QLabel {{
+            color: {COLORS['text_primary']};
         }}
         QGroupBox {{
-            font-weight: bold;
-            border: 2px solid {COLORS['border']};
-            border-radius: 8px;
-            margin-top: 10px;
-            padding: 15px;
+            font-weight: 600;
+            border: 1px solid {COLORS['border']};
+            border-radius: 4px;
+            margin-top: 8px;
+            padding: 12px;
             background-color: {COLORS['card_bg']};
         }}
         QGroupBox::title {{
             subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 8px;
+            left: 8px;
+            padding: 0 6px;
             color: {COLORS['text_primary']};
+            font-size: 9pt;
         }}
-        QLabel {{
-            color: {COLORS['text_primary']};
+        QPushButton {{
+            font-family: {font_family};
+            font-size: 9pt;
+            padding: 5px 12px;
+            border: 1px solid {COLORS['border']};
+            border-radius: 2px;
+            background-color: {COLORS['card_bg']};
+        }}
+        QPushButton:hover {{
+            background-color: {COLORS['primary_light']};
+            border-color: {COLORS['primary']};
+        }}
+        QPushButton:pressed {{
+            background-color: {COLORS['primary']};
+            color: white;
+        }}
+        QComboBox {{
+            font-family: {font_family};
+            font-size: 9pt;
+            padding: 4px 8px;
+            border: 1px solid {COLORS['border']};
+            border-radius: 2px;
+            background-color: {COLORS['card_bg']};
+        }}
+        QLineEdit {{
+            font-family: {font_family};
+            font-size: 9pt;
+            padding: 4px 8px;
+            border: 1px solid {COLORS['border']};
+            border-radius: 2px;
+        }}
+        QSpinBox {{
+            font-family: {font_family};
+            font-size: 9pt;
+            padding: 4px;
+            border: 1px solid {COLORS['border']};
+            border-radius: 2px;
+        }}
+        QTextEdit {{
+            font-family: {get_mono_font()};
+            font-size: 9pt;
+            border: 1px solid {COLORS['border']};
+            border-radius: 2px;
+        }}
+        QTabWidget::pane {{
+            border: 1px solid {COLORS['border']};
+            background-color: {COLORS['card_bg']};
+        }}
+        QTabBar::tab {{
+            font-family: {font_family};
+            font-size: 9pt;
+            padding: 6px 12px;
+            margin-right: 2px;
+            border: 1px solid {COLORS['border']};
+            border-bottom: none;
+            border-top-left-radius: 2px;
+            border-top-right-radius: 2px;
+            background-color: {COLORS['background']};
+        }}
+        QTabBar::tab:selected {{
+            background-color: {COLORS['card_bg']};
+            border-bottom: 2px solid {COLORS['primary']};
         }}
         QFormLayout QLabel {{
             color: {COLORS['text_secondary']};
