@@ -17,6 +17,7 @@ import re
 import time
 import threading
 import platform
+import json
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Callable
@@ -34,7 +35,7 @@ from PyQt6.QtWidgets import (
     QFrame, QProgressBar, QGraphicsDropShadowEffect, QTabWidget,
     QScrollArea, QGridLayout, QTableWidget, QTableWidgetItem
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QSize, QUrl
 from PyQt6.QtGui import QFont, QColor, QTextCharFormat, QBrush, QIcon, QPalette
 from PyQt6.QtCore import QSize
 from PyQt6.QtWidgets import QSizePolicy
@@ -50,8 +51,7 @@ except ImportError:
     print("警告: PyQt6-WebEngine 或 folium 未安装，地图功能将以文本模式运行")
     print("如需完整地图功能，请运行: pip install PyQt6-WebEngine folium")
 
-# 现代化配色方案
-# Windows 风格配色方案 - 更中性的色调
+# Windows 风格配色方案
 COLORS = {
     'primary': '#0078D4',        # Windows 蓝
     'primary_dark': '#005A9E',   # 深蓝色
@@ -94,7 +94,6 @@ ICONS = {
     'connected': '[已连接]',
     'disconnected': '[未连接]',
     'pending': '[等待]',
-    # 新增图标
     'script': '[脚本]',
     'result': '[结果]',
     'map': '[地图]',
@@ -419,6 +418,7 @@ class ADBHelper:
                 
                 state_map = {
                     'READY': '就绪',
+                    'LOADED': '已加载',
                     'PIN_REQUIRED': '需要PIN码',
                     'PUK_REQUIRED': '需要PUK码',
                     'NETWORK_LOCKED': '网络锁定',
@@ -452,83 +452,200 @@ class ADBHelper:
         # 电话号码 - 使用多种方法尝试获取
         phone_number = None
         
-        # 方法1: iphonesubinfo service
-        service_names = ['iphonesubinfo']
-        if slot == 1:
-            service_names.append('iphonesubinfo2')
+        # 方法1: iphonesubinfo service (最常用)
+        # 13 - getLine1Number, 其他可能的命令: 11=getDeviceId, 15=getSubscriberId
+        # 注意：不同slot使用不同的service名称
+        if slot == 0:
+            service_commands = [
+                ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo', '13'],  # getLine1Number
+                ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo', '11'],  # getDeviceId
+            ]
+        else:
+            # 卡二使用 iphonesubinfo2
+            service_commands = [
+                ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo2', '13'],
+                ['adb', '-s', serial, 'shell', 'service', 'call', 'iphonesubinfo2', '11'],
+            ]
         
-        for service in service_names:
-            cmd = ['adb', '-s', serial, 'shell', 'service', 'call', service, '13']
+        for cmd in service_commands:
             success, stdout, _ = cls.execute_command(cmd, timeout=5)
             if success and stdout:
-                # 解析返回的 Parcel 数据
-                # 格式类似: Result: Parcel(0x...) 或包含 's16' 和号码
-                match = re.search(r"'(\d+)'", stdout)
-                if match and len(match.group(1)) > 5:
-                    phone_number = match.group(1)
-                    break
-                # 尝试另一种格式
-                lines = stdout.split('\n')
-                for line in lines:
-                    if re.match(r'^\d{11}$', line.strip()):
-                        phone_number = line.strip()
-                        break
-        
-        # 方法2: 使用 telephony 数据库查询（部分设备支持）
-        if not phone_number:
-            cmd = ['adb', '-s', serial, 'shell', 'content', 'query', 
-                   '--uri', f'content://telephony/siminfo/{slot+1}']
-            success, stdout, _ = cls.execute_command(cmd, timeout=5)
-            if success and stdout:
-                match = re.search(r'number=(\d+)', stdout)
+                print(f"[DEBUG] SIM卡{slot+1} 号码查询结果: {stdout[:200]}")
+                
+                # 解析 Parcel 数据
+                # 格式1: Result: Parcel(00000000 00000001   '13800138000')
+                # 格式2: Result: Parcel(0x... 's16' ...)
+                # 格式3: 16进制编码 '00310030.00380038' -> 需要解码
+                import re
+                
+                # 方法A: 直接匹配引号中的号码
+                match = re.search(r"'(\d{11,15})'", stdout)
                 if match:
                     phone_number = match.group(1)
+                    print(f"[DEBUG] SIM卡{slot+1} 号码解析(引号匹配): {phone_number}")
+                    break
+                
+                # 方法B: 提取16进制编码的Unicode字符 (Android 10+格式)
+                # 格式: 0031 0030 0038 ... (每个数字是Unicode编码，0x30-0x39对应0-9)
+                hex_codes = re.findall(r'00(3[0-9])', stdout)
+                if hex_codes and len(hex_codes) >= 11:
+                    try:
+                        # 0x30='0', 0x31='1', ..., 0x39='9'
+                        digits = [str(int(h, 16) - 48) for h in hex_codes]
+                        result = ''.join(digits)
+                        print(f"[DEBUG] SIM卡{slot+1} 16进制解码结果: {result}")
+                        if len(result) >= 11 and result.startswith('1'):
+                            phone_number = result[:11]  # 取前11位
+                            print(f"[DEBUG] SIM卡{slot+1} 号码解析(16进制正序): {phone_number}")
+                            break
+                        # 如果不是1开头，可能是反序存储
+                        elif len(result) >= 11:
+                            reversed_num = result[::-1]
+                            if reversed_num.startswith('1'):
+                                phone_number = reversed_num[:11]
+                                print(f"[DEBUG] SIM卡{slot+1} 号码解析(16进制反序): {phone_number}")
+                                break
+                    except Exception as e:
+                        print(f"[DEBUG] SIM卡{slot+1} 16进制解析错误: {e}")
+                
+                # 方法C: 尝试提取任何11位以上数字
+                numbers = re.findall(r'\d{11,15}', stdout)
+                if numbers:
+                    phone_number = numbers[0]
+                    print(f"[DEBUG] SIM卡{slot+1} 号码解析(数字提取): {phone_number}")
+                    break
         
-        # 方法3: 从 SIM 卡信息中获取
+        # 方法2: 使用 telephony 数据库查询
         if not phone_number:
-            cmd = ['adb', '-s', serial, 'shell', 'getprop', f'gsm.sim.msisdn.slot{slot}']
-            success, stdout, _ = cls.execute_command(cmd)
-            if success and stdout.strip():
-                phone_number = stdout.strip()
+            try:
+                # 尝试查询 SIM 信息数据库
+                cmd = ['adb', '-s', serial, 'shell', 'content', 'query', 
+                       '--uri', f'content://telephony/siminfo/{slot+1}']
+                success, stdout, _ = cls.execute_command(cmd, timeout=5)
+                if success and stdout:
+                    # 解析 number=xxx
+                    match = re.search(r'number[=:](\d+)', stdout)
+                    if match and len(match.group(1)) >= 11:
+                        phone_number = match.group(1)
+            except:
+                pass
+        
+        # 方法3: 从 getprop 获取
+        if not phone_number:
+            prop_names = [
+                f'gsm.sim.msisdn.slot{slot}',
+                f'gsm.sim.msisdn.{slot}',
+                'gsm.sim.msisdn',
+                f'persist.radio.msidsn.slot{slot}',
+            ]
+            for prop in prop_names:
+                cmd = ['adb', '-s', serial, 'shell', 'getprop', prop]
+                success, stdout, _ = cls.execute_command(cmd, timeout=3)
+                if success and stdout.strip():
+                    num = stdout.strip()
+                    if len(num) >= 11 and num.isdigit():
+                        phone_number = num
+                        break
+        
+        # 方法4: 使用 dumpsys 获取
+        if not phone_number:
+            try:
+                cmd = ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry']
+                success, stdout, _ = cls.execute_command(cmd, timeout=5)
+                if success and stdout:
+                    # 尝试匹配 mMsisdn 字段
+                    import re
+                    pattern = rf'mMsisdn\[{slot}\]\s*=\s*(\d+)'
+                    match = re.search(pattern, stdout)
+                    if match and len(match.group(1)) >= 11:
+                        phone_number = match.group(1)
+            except:
+                pass
+        
+        # 方法5: 使用 iphonesubinfo 的 transact 方法 (Android 10+)
+        if not phone_number:
+            try:
+                # 尝试使用 binder call 获取
+                service_name = f'iphonesubinfo{slot+1}' if slot > 0 else 'iphonesubinfo'
+                cmd = ['adb', '-s', serial, 'shell', 'service', 'call', service_name, '1']
+                success, stdout, _ = cls.execute_command(cmd, timeout=5)
+                if success and stdout:
+                    import re
+                    # 查找 's16' 后面的字符串
+                    match = re.search(r"s16\s*'([^']{11,15})'", stdout)
+                    if match:
+                        phone_number = match.group(1)
+            except:
+                pass
+        
+        # 方法6: 通过 SubscriptionManager 获取
+        if not phone_number:
+            try:
+                # 使用 cmd phone 命令
+                cmd = ['adb', '-s', serial, 'shell', 'cmd', 'phone', 'number', f'--slot', str(slot)]
+                success, stdout, _ = cls.execute_command(cmd, timeout=5)
+                if success and stdout.strip():
+                    num = stdout.strip().replace(' ', '').replace('-', '')
+                    if len(num) >= 11 and num.isdigit():
+                        phone_number = num
+            except:
+                pass
         
         sim.phone_number = phone_number if phone_number else "未知"
         
         # 信号强度 - 改进的信号读取
         signal_level = -1
         
-        # 方法1: dumpsys telephony.registry
+        # 方法1: dumpsys telephony.registry - 按顺序提取每个SignalStrength块的level
         success, stdout, _ = cls.execute_command(
             ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry'],
             timeout=5
         )
         if success and stdout:
-            # 针对 slot 的匹配
-            patterns = [
-                rf'CellSignalStrength[^\n]*{{[^}}]*mLevel=(\d+)[^}}]*slot={slot}',
-                rf'CellSignalStrength[^\n]*slot={slot}[^\n]*mLevel=(\d+)',
-                rf'mSignalStrength[^\n]*slot={slot}[^\n]*level[:=](\d+)',
-                rf'\[slot={slot}\][^\n]*CellSignalStrength[^\n]*level[:=](\d+)',
-                # 更宽松的匹配
-                rf'mSignalStrength.*?level=(\d+)',
-                rf'level[:=]\s*(\d+)',
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, stdout, re.DOTALL)
-                if match:
-                    try:
-                        level = int(match.group(1))
-                        if 0 <= level <= 4:
-                            signal_level = level
-                            break
-                    except:
-                        pass
+            import re
+            # 查找所有 mSignalStrength 完整记录（包含块和primary）
+            # 格式: mSignalStrength=SignalStrength:{...},primary=CellSignalStrengthXxx
+            # 设备按slot顺序输出，第一个记录是slot0，第二个是slot1
+            signal_records = re.findall(
+                r'mSignalStrength=SignalStrength:(\{.*?\}),primary=(CellSignalStrength\w+)',
+                stdout, re.DOTALL
+            )
+            
+            if signal_records and slot < len(signal_records):
+                block, primary_type = signal_records[slot]
+                
+                # 方法1: 查找primary信号类型的level
+                # 格式: mNr=CellSignalStrengthNr:{...}
+                type_pattern = rf'{primary_type}:\s*\{{(.*?)\}}(?:,|$)'
+                type_match = re.search(type_pattern, block, re.DOTALL)
+                if type_match:
+                    type_data = type_match.group(1)
+                    level_match = re.search(r'level\s*=\s*(\d+)', type_data)
+                    if level_match:
+                        try:
+                            level = int(level_match.group(1))
+                            if 0 <= level <= 4:
+                                signal_level = level
+                        except:
+                            pass
+                
+                # 方法2: 如果primary没找到，取所有类型中的最大level
+                if signal_level < 0:
+                    levels = re.findall(r'level\s*=\s*(\d+)', block)
+                    if levels:
+                        try:
+                            max_level = max(int(l) for l in levels)
+                            if 0 <= max_level <= 4:
+                                signal_level = max_level
+                        except:
+                            pass
         
         # 方法2: 通过 settings 获取
         if signal_level < 0:
             cmd = ['adb', '-s', serial, 'shell', 'settings', 'get', 'global', 
                    f'mobile_data_signal_strength_slot_{slot}']
             success, stdout, _ = cls.execute_command(cmd, timeout=3)
-            if success and stdout.strip():
+            if success and stdout.strip() and stdout.strip() != 'null':
                 try:
                     signal_level = int(stdout.strip())
                 except:
@@ -574,26 +691,43 @@ class ADBHelper:
     
     @classmethod
     def make_call(cls, serial: str, phone_number: str, sim_slot: int = 0) -> bool:
-        """拨打电话 - 使用service call直接拨号"""
+        """拨打电话 - 使用am start直接拨号"""
         import time
+        
+        print(f"[DEBUG make_call] 开始拨号: serial={serial}, phone={phone_number}")
         
         # 清除可能存在的旧通话状态
         cls.execute_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_ENDCALL'], timeout=2)
         time.sleep(0.5)
         
-        # 方法1: 使用 service call phone 直接拨号（最可靠）
-        # 2 表示 CALL 操作，s16 表示字符串参数
+        # 方法1: 使用 am start -a android.intent.action.CALL 直接拨号（最可靠）
+        try:
+            cmd = [
+                'adb', '-s', serial, 'shell', 'am', 'start',
+                '-a', 'android.intent.action.CALL',
+                '-d', f'tel:{phone_number}'
+            ]
+            print(f"[DEBUG make_call] 执行命令: {' '.join(cmd)}")
+            success, stdout, stderr = cls.execute_command(cmd, timeout=5)
+            print(f"[DEBUG make_call] 结果: success={success}, stdout={stdout[:100] if stdout else 'None'}, stderr={stderr[:100] if stderr else 'None'}")
+            # CALL action会直接拨号，不需要额外点击
+            if success:
+                time.sleep(1)
+                return True
+        except Exception as e:
+            print(f"[ERROR] am start CALL 失败: {e}")
+        
+        # 方法2: 使用 service call phone（备用方案）
         try:
             cmd = ['adb', '-s', serial, 'shell', 'service', 'call', 'phone', '2', 's16', phone_number]
             success, stdout, stderr = cls.execute_command(cmd, timeout=5)
             if success and ('Parcel' in stdout or 'Result' in stdout):
-                # 等待一下确保拨号已发起
                 time.sleep(1)
                 return True
         except Exception as e:
             print(f"service call phone 失败: {e}")
         
-        # 方法2: 使用 am start 打开拨号界面并模拟点击
+        # 方法3: 使用 am start DIAL 打开拨号界面（需要手动点击）
         try:
             # 先打开拨号界面
             cmd = [
@@ -653,17 +787,35 @@ class ADBHelper:
     
     @classmethod
     def get_call_state(cls, serial: str) -> str:
-        """获取通话状态"""
-        cmd = ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry']
-        success, stdout, _ = cls.execute_command(cmd)
-        if success:
-            if 'mCallState=1' in stdout or 'CALL_STATE_OFFHOOK' in stdout:
-                return "通话中"
-            elif 'mCallState=2' in stdout or 'CALL_STATE_RINGING' in stdout:
+        """获取通话状态 - 简化版，优先稳定性"""
+        try:
+            import re
+            
+            cmd = ['adb', '-s', serial, 'shell', 'dumpsys', 'telephony.registry']
+            success, stdout, stderr = cls.execute_command(cmd, timeout=5)
+            
+            if not success or not stdout:
+                return "未知"
+            
+            # 简单检查：先看mCallState
+            if 'mCallState=2' in stdout:
                 return "响铃中"
-            else:
+            elif 'mCallState=1' in stdout:
+                # 检查是否有mConnectTime且不为0
+                if 'mConnectTime=0' in stdout or 'mConnectTime=-1' in stdout:
+                    return "拨号中"  # 正在拨号，对方未接听
+                elif 'mConnectTime=' in stdout:
+                    # 有连接时间且不为0，说明已接通
+                    return "已接通"
+                else:
+                    return "通话中"
+            elif 'mCallState=0' in stdout:
                 return "空闲"
-        return "未知"
+            else:
+                return "未知"
+        except Exception as e:
+            print(f"[ERROR] get_call_state异常: {e}")
+            return "未知"
     
     @classmethod
     def send_sms(cls, serial: str, phone_number: str, message: str, sim_slot: int = 0) -> bool:
@@ -757,15 +909,23 @@ class ADBHelper:
             'sim_slot': sim_slot
         }
         
+        print(f"[DEBUG SMS] 开始发送短信: serial={serial}, phone={phone_number}, slot={sim_slot}")
+        
         try:
-            # 方法1: 尝试直接通过service发送
+            # 方法1: 尝试直接通过service发送（需要root权限）
+            print(f"[DEBUG SMS] 尝试方法1: service call（需要root）")
             if cls._send_sms_via_service(serial, phone_number, message, sim_slot):
+                print(f"[DEBUG SMS] 方法1成功（设备已root）")
                 result['success'] = True
                 result['method'] = 'service_call'
+                result['note'] = '后台自动发送成功（root设备）'
                 return result
+            print(f"[DEBUG SMS] 方法1失败（设备未root或无权限），使用方法2")
             
-            # 方法2: 使用Intent打开短信应用
+            # 方法2: 使用Intent打开短信应用（非root设备的标准做法）
             escaped_msg = message.replace('"', '\\"').replace("'", "\\'")
+            
+            # 优先使用最通用的Intent格式
             cmd = [
                 'adb', '-s', serial, 'shell', 'am', 'start',
                 '-a', 'android.intent.action.SENDTO',
@@ -773,18 +933,26 @@ class ADBHelper:
                 '--es', 'sms_body', escaped_msg
             ]
             
+            print(f"[DEBUG SMS] 尝试方法2: 打开短信应用")
             success, stdout, stderr = cls.execute_command(cmd, timeout=10)
+            print(f"[DEBUG SMS] 方法2结果: success={success}")
             
             if success:
                 result['success'] = True
                 result['method'] = 'intent'
                 result['note'] = '已打开短信应用，请手动点击发送'
+                print(f"[DEBUG SMS] 方法2成功，等待用户手动发送")
             else:
-                result['error'] = stderr or 'Unknown error'
+                result['error'] = f'无法打开短信应用: {stderr or "Unknown error"}'
+                print(f"[DEBUG SMS] 方法2失败: {result['error']}")
                 
         except Exception as e:
+            print(f"[DEBUG SMS] 异常: {e}")
+            import traceback
+            traceback.print_exc()
             result['error'] = str(e)
         
+        print(f"[DEBUG SMS] 最终结果: {result}")
         return result
 
 
@@ -799,7 +967,8 @@ class CallWorker(QThread):
     result_signal = pyqtSignal(dict)  # 结果记录信号：详细拨打记录
     
     def __init__(self, serial: str, phone_number: str, duration: int, count: int, 
-                 sim_card: str = "卡一", ping_enabled: bool = False, ping_sim: str = ""):
+                 sim_card: str = "卡一", ping_enabled: bool = False, ping_sim: str = "", ping_target: str = "",
+                 interval: int = 2):
         super().__init__()
         self.serial = serial
         self.phone_number = phone_number
@@ -808,6 +977,8 @@ class CallWorker(QThread):
         self.sim_card = sim_card  # 使用的SIM卡
         self.ping_enabled = ping_enabled  # 是否启用Ping
         self.ping_sim = ping_sim  # Ping使用的SIM卡
+        self.ping_target = ping_target  # Ping目标地址
+        self.interval = interval  # 通话间隔（秒）
         self.is_running = True
         self.current_count = 0
     
@@ -815,172 +986,201 @@ class CallWorker(QThread):
         """执行拨打任务并记录详细结果"""
         from datetime import datetime
         
-        self.log_signal.emit(f"开始拨打测试 - 目标号码: {self.phone_number}, "
-                            f"通话时长: {self.duration}秒, 拨打次数: {self.count}", "info")
-        
-        for i in range(1, self.count + 1):
-            if not self.is_running:
-                self.log_signal.emit("拨打任务已手动停止", "warning")
-                break
+        try:
+            self.log_signal.emit(f"开始拨打测试 - 目标号码: {self.phone_number}, "
+                                f"通话时长: {self.duration}秒, 拨打次数: {self.count}", "info")
             
-            self.current_count = i
-            self.progress_signal.emit(i, self.count)
-            
-            # 记录开始时间
-            start_time = datetime.now()
-            
-            self.log_signal.emit(f"\n{'='*50}", "info")
-            self.log_signal.emit(f"第 {i}/{self.count} 次拨打", "info")
-            self.status_signal.emit(f"正在拨打... ({i}/{self.count})")
-            
-            # 获取当前信号状态
-            signal_info = self._get_signal_info()
-            
-            # 拨打电话
-            self.log_signal.emit(f"正在拨打: {self.phone_number}", "info")
-            # 将 sim_card 字符串转换为 slot 数字
-            sim_slot = 0 if self.sim_card == "卡一" else 1
-            call_success = ADBHelper.make_call(self.serial, self.phone_number, sim_slot)
-            
-            if not call_success:
-                self.log_signal.emit("拨打电话失败！", "error")
-                # 发送失败结果
-                result_record = {
-                    'index': i,
-                    'time': start_time.strftime("%H:%M:%S"),
-                    'phone_number': self.phone_number,
-                    'sim_card': self.sim_card,
-                    'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
-                    'call_result': '失败(拨号失败)',
-                    'signal_status': signal_info['text'],
-                    'signal_level': signal_info['level'],
-                    'duration': 0,
-                    'remark': '拨号失败'
-                }
-                self.result_signal.emit(result_record)
-                continue
-            
-            self.log_signal.emit("电话已拨出", "success")
-            
-            # 等待电话接通
-            self.log_signal.emit("等待接通...", "info")
-            connected = False
-            wait_time = 0
-            max_wait = 30  # 最长等待30秒
-            
-            while wait_time < max_wait and self.is_running:
-                time.sleep(1)
-                wait_time += 1
-                state = ADBHelper.get_call_state(self.serial)
-                if state == "通话中":
-                    connected = True
-                    self.log_signal.emit("电话已接通", "success")
-                    # 发射位置记录信号
-                    self.location_signal.emit(self.phone_number, i, self.count)
+            for i in range(1, self.count + 1):
+                if not self.is_running:
+                    self.log_signal.emit("拨打任务已手动停止", "warning")
                     break
+                
+                try:
+                    self._do_single_call(i)
+                except Exception as e:
+                    self.log_signal.emit(f"第{i}次拨打出错: {str(e)[:50]}", "error")
+                    print(f"[ERROR CallWorker] 单次拨打异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
             
-            if not self.is_running:
-                self.log_signal.emit("拨打任务已停止", "warning")
-                ADBHelper.end_call(self.serial)
-                # 发送停止结果
-                result_record = {
-                    'index': i,
-                    'time': start_time.strftime("%H:%M:%S"),
-                    'phone_number': self.phone_number,
-                    'sim_card': self.sim_card,
-                    'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
-                    'call_result': '已停止',
-                    'signal_status': signal_info['text'],
-                    'signal_level': signal_info['level'],
-                    'duration': wait_time,
-                    'remark': '用户手动停止'
-                }
-                self.result_signal.emit(result_record)
+            self.status_signal.emit("就绪")
+            self.log_signal.emit(f"\n{'='*50}", "info")
+            self.log_signal.emit("拨打测试完成", "success")
+            self.finished_signal.emit()
+            
+        except Exception as e:
+            print(f"[ERROR CallWorker] run方法异常: {e}")
+            import traceback
+            traceback.print_exc()
+            self.log_signal.emit(f"拨打任务异常: {str(e)[:50]}", "error")
+            self.finished_signal.emit()
+    
+    def _do_single_call(self, i: int):
+        """执行单次拨打"""
+        from datetime import datetime
+        
+        self.current_count = i
+        self.progress_signal.emit(i, self.count)
+        
+        # 记录开始时间
+        start_time = datetime.now()
+        
+        self.log_signal.emit(f"\n{'='*50}", "info")
+        self.log_signal.emit(f"第 {i}/{self.count} 次拨打", "info")
+        self.status_signal.emit(f"正在拨打... ({i}/{self.count})")
+        
+        # 获取当前信号状态
+        signal_info = self._get_signal_info()
+        
+        # 如果启用了 Ping，先执行 Ping 测试
+        ping_success = None
+        ping_result = "无"
+        if self.ping_enabled and self.ping_target:
+            self.log_signal.emit(f"[计时] 开始Ping测试...", "info")
+            ping_start = time.time()
+            ping_success = self._run_ping_test()
+            ping_elapsed = time.time() - ping_start
+            ping_result = f"{self.ping_sim} {'成功' if ping_success else '失败'}"
+            self.log_signal.emit(f"[计时] Ping测试耗时: {ping_elapsed:.1f}秒", "info")
+        
+        # 拨打电话
+        self.log_signal.emit(f"正在拨打: {self.phone_number}", "info")
+        # 将 sim_card 字符串转换为 slot 数字
+        sim_slot = 0 if self.sim_card == "卡一" else 1
+        self.log_signal.emit(f"使用SIM卡槽: {sim_slot+1} ({self.sim_card})", "info")
+        
+        print(f"[DEBUG] 开始拨号: serial={self.serial}, phone={self.phone_number}, slot={sim_slot}")
+        try:
+            call_success = ADBHelper.make_call(self.serial, self.phone_number, sim_slot)
+            print(f"[DEBUG] 拨号结果: {call_success}")
+        except Exception as e:
+            print(f"[ERROR] 拨号异常: {e}")
+            import traceback
+            traceback.print_exc()
+            call_success = False
+        
+        if not call_success:
+            self.log_signal.emit("拨打电话失败！请检查:", "error")
+            self.log_signal.emit("1. 设备是否已授权ADB调试", "warning")
+            self.log_signal.emit("2. 是否有拨打电话权限", "warning")
+            self.log_signal.emit("3. SIM卡是否正常并有信号", "warning")
+            # 发送失败结果
+            result_record = {
+                'index': i,
+                'time': start_time.strftime("%H:%M:%S"),
+                'phone_number': self.phone_number,
+                'sim_card': self.sim_card,
+                'ping_status': ping_result if ping_success is not None else ("无" if not self.ping_enabled else f"{self.ping_sim}失败"),
+                'call_result': '失败(拨号失败)',
+                'signal_status': signal_info['text'],
+                'signal_level': signal_info['level'],
+                'duration': 0,
+                'remark': '拨号失败'
+            }
+            self.result_signal.emit(result_record)
+            return
+        
+        self.log_signal.emit("电话已拨出", "success")
+        
+        # 等待电话接通
+        self.log_signal.emit("等待接通...", "info")
+        connected = False
+        wait_time = 0
+        max_wait = 30  # 最长等待30秒
+        
+        while wait_time < max_wait and self.is_running:
+            time.sleep(1)
+            wait_time += 1
+            state = ADBHelper.get_call_state(self.serial)
+            print(f"[DEBUG State] 通话状态: {state} (已等待{wait_time}秒)")
+            
+            # 检测到"已接通"状态才真正开始计时
+            if state == "已接通":
+                connected = True
+                self.log_signal.emit(f"✅ 对方已接听 (等待{wait_time}秒)", "success")
+                # 发射位置记录信号
+                print(f"[DEBUG CallWorker] 发射位置信号")
+                try:
+                    self.location_signal.emit(self.phone_number, i, self.count)
+                    print(f"[DEBUG CallWorker] 位置信号已发射")
+                except Exception as e:
+                    print(f"[ERROR] 位置信号失败: {e}")
                 break
-            
-            if not connected:
-                self.log_signal.emit("等待接通超时，挂断电话", "warning")
-                ADBHelper.end_call(self.serial)
-                # 发送超时结果
-                result_record = {
-                    'index': i,
-                    'time': start_time.strftime("%H:%M:%S"),
-                    'phone_number': self.phone_number,
-                    'sim_card': self.sim_card,
-                    'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
-                    'call_result': '超时(未接通)',
-                    'signal_status': signal_info['text'],
-                    'signal_level': signal_info['level'],
-                    'duration': wait_time,
-                    'remark': f'等待{wait_time}秒未接通'
-                }
-                self.result_signal.emit(result_record)
-                time.sleep(2)
-                continue
-            
-            # 保持通话
-            self.status_signal.emit(f"通话中... ({i}/{self.count})")
-            self.log_signal.emit(f"保持通话 {self.duration} 秒...", "info")
-            
-            elapsed = 0
-            while elapsed < self.duration and self.is_running:
-                time.sleep(1)
-                elapsed += 1
-                if elapsed % 5 == 0:
-                    self.log_signal.emit(f"通话中... {elapsed}/{self.duration} 秒", "info")
-            
-            if not self.is_running:
-                self.log_signal.emit("拨打任务已停止，挂断电话", "warning")
-                ADBHelper.end_call(self.serial)
-                # 发送停止结果
-                result_record = {
-                    'index': i,
-                    'time': start_time.strftime("%H:%M:%S"),
-                    'phone_number': self.phone_number,
-                    'sim_card': self.sim_card,
-                    'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
-                    'call_result': '已停止',
-                    'signal_status': signal_info['text'],
-                    'signal_level': signal_info['level'],
-                    'duration': elapsed,
-                    'remark': '通话中用户停止'
-                }
-                self.result_signal.emit(result_record)
-                break
-            
-            # 挂断电话
-            self.log_signal.emit("挂断电话", "info")
-            hangup_success = ADBHelper.end_call(self.serial)
-            
-            if hangup_success:
-                self.log_signal.emit("电话已挂断", "success")
-            else:
-                self.log_signal.emit("挂断电话可能失败", "warning")
-            
-            # 发送成功结果
+        
+        if not self.is_running:
+            self.log_signal.emit("拨打任务已停止", "warning")
+            ADBHelper.end_call(self.serial)
+            return
+        
+        if not connected:
+            self.log_signal.emit("等待接通超时，挂断电话", "warning")
+            ADBHelper.end_call(self.serial)
+            # 发送超时结果
             result_record = {
                 'index': i,
                 'time': start_time.strftime("%H:%M:%S"),
                 'phone_number': self.phone_number,
                 'sim_card': self.sim_card,
                 'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
-                'call_result': '成功',
+                'call_result': '超时(未接通)',
                 'signal_status': signal_info['text'],
                 'signal_level': signal_info['level'],
-                'duration': self.duration,
-                'remark': '通话正常完成'
+                'duration': wait_time,
+                'remark': f'等待{wait_time}秒未接通'
             }
             self.result_signal.emit(result_record)
-            
-            # 等待2秒再进行下一次拨打
-            if i < self.count:
-                self.log_signal.emit("等待2秒后进行下一次拨打...", "info")
-                time.sleep(2)
+            time.sleep(2)
+            return
         
-        self.status_signal.emit("就绪")
-        self.log_signal.emit(f"\n{'='*50}", "info")
-        self.log_signal.emit("拨打测试完成", "success")
-        self.finished_signal.emit()
+        # 保持通话 - 从接通时刻开始计时，严格保持self.duration秒
+        if connected:
+            self.status_signal.emit(f"通话中... ({i}/{self.count})")
+            self.log_signal.emit(f"[计时] 开始保持通话 {self.duration} 秒...", "info")
+            
+            elapsed = 0
+            while elapsed < self.duration and self.is_running:
+                time.sleep(1)
+                elapsed += 1
+                # 每3秒或最后1秒显示进度
+                if elapsed % 3 == 0 or elapsed == self.duration:
+                    self.log_signal.emit(f"通话中... {elapsed}/{self.duration} 秒", "info")
+            
+            self.log_signal.emit(f"[计时] 通话时长达到{elapsed}秒，准备挂断", "info")
+        
+        if not self.is_running:
+            self.log_signal.emit("拨打任务已停止，挂断电话", "warning")
+            ADBHelper.end_call(self.serial)
+            return
+        
+        # 挂断电话
+        self.log_signal.emit("挂断电话", "info")
+        hangup_success = ADBHelper.end_call(self.serial)
+        
+        if hangup_success:
+            self.log_signal.emit("✅ 电话已挂断", "success")
+        else:
+            self.log_signal.emit("⚠️ 挂断电话可能失败", "warning")
+        
+        # 发送成功结果
+        result_record = {
+            'index': i,
+            'time': start_time.strftime("%H:%M:%S"),
+            'phone_number': self.phone_number,
+            'sim_card': self.sim_card,
+            'ping_status': f"{self.ping_sim}进行中" if self.ping_enabled else "无",
+            'call_result': '成功',
+            'signal_status': signal_info['text'],
+            'signal_level': signal_info['level'],
+            'duration': self.duration,
+            'remark': '通话正常完成'
+        }
+        self.result_signal.emit(result_record)
+        
+        # 等待间隔时间再进行下一次拨打
+        if i < self.count and self.interval > 0:
+            self.log_signal.emit(f"等待{self.interval}秒后进行下一次拨打...", "info")
+            time.sleep(self.interval)
     
     def _get_signal_info(self) -> dict:
         """获取当前信号信息"""
@@ -1020,13 +1220,61 @@ class CallWorker(QThread):
         except:
             return {'level': 0, 'text': '获取失败'}
     
+    def _run_ping_test(self) -> bool:
+        """执行 Ping 测试"""
+        if not self.ping_target:
+            return False
+        
+        self.log_signal.emit(f"[Ping] 正在测试 {self.ping_target}...", "info")
+        
+        try:
+            # 使用 adb shell ping
+            cmd = [
+                'adb', '-s', self.serial, 'shell',
+                'ping', '-c', '4', '-W', '2',  # 4次，超时2秒
+                self.ping_target
+            ]
+            
+            success, stdout, stderr = ADBHelper.execute_command(cmd, timeout=15)
+            
+            if success and stdout:
+                # 解析 ping 结果
+                import re
+                
+                # 检查是否有 "0% packet loss"
+                if '0% packet loss' in stdout or ' 0%' in stdout:
+                    self.log_signal.emit(f"[Ping] {self.ping_target} 成功 (0% 丢包)", "success")
+                    return True
+                else:
+                    # 提取丢包率
+                    match = re.search(r'(\d+)% packet loss', stdout)
+                    if match:
+                        loss = int(match.group(1))
+                        self.log_signal.emit(f"[Ping] {self.ping_target} 丢包率 {loss}%", "warning" if loss < 50 else "error")
+                        return loss < 50  # 丢包率小于50%认为成功
+                    else:
+                        # 检查是否有回复
+                        if 'bytes from' in stdout or 'icmp_seq' in stdout:
+                            self.log_signal.emit(f"[Ping] {self.ping_target} 有响应", "success")
+                            return True
+                        else:
+                            self.log_signal.emit(f"[Ping] {self.ping_target} 无响应", "error")
+                            return False
+            else:
+                self.log_signal.emit(f"[Ping] {self.ping_target} 测试失败", "error")
+                return False
+                
+        except Exception as e:
+            self.log_signal.emit(f"[Ping] 测试异常: {str(e)[:50]}", "error")
+            return False
+    
     def stop(self):
         """停止拨打任务"""
         self.is_running = False
 
 
 class SMSWorker(QThread):
-    """短信发送工作线程"""
+    """短信发送工作线程（支持并发Ping）"""
     
     log_signal = pyqtSignal(str, str)  # 日志消息，类型
     progress_signal = pyqtSignal(int, int)  # 当前次数，总次数
@@ -1035,13 +1283,18 @@ class SMSWorker(QThread):
     result_signal = pyqtSignal(dict)  # 结果记录信号
     
     def __init__(self, serial: str, phone_number: str, message: str, 
-                 sim_slot: int = 0, count: int = 1):
+                 sim_slot: int = 0, count: int = 1, interval: int = 2,
+                 ping_enabled: bool = False, ping_sim: str = "", ping_target: str = ""):
         super().__init__()
         self.serial = serial
         self.phone_number = phone_number
         self.message = message
         self.sim_slot = sim_slot
         self.count = count
+        self.interval = interval  # 发送间隔（秒）
+        self.ping_enabled = ping_enabled  # 是否启用Ping
+        self.ping_sim = ping_sim  # Ping使用的SIM卡
+        self.ping_target = ping_target  # Ping目标地址
         self.is_running = True
         self.current_count = 0
     
@@ -1069,14 +1322,26 @@ class SMSWorker(QThread):
             # 记录位置
             self._record_location()
             
+            # 如果启用了 Ping，先执行 Ping 测试
+            ping_success = None
+            ping_result = "无"
+            if self.ping_enabled and self.ping_target:
+                ping_success = self._run_ping_test()
+                ping_result = f"{'成功' if ping_success else '失败'}"
+            
             # 发送短信
-            self.log_signal.emit(f"正在发送短信到: {self.phone_number}", "info")
+            self.log_signal.emit(f"正在发送短信到: {self.phone_number} (SIM卡{self.sim_slot + 1})", "info")
+            self.log_signal.emit(f"短信内容: {self.message[:50]}...", "info")
+            
             result = ADBHelper.send_sms_direct(
                 self.serial, 
                 self.phone_number, 
                 self.message,
                 self.sim_slot
             )
+            
+            # 调试日志
+            self.log_signal.emit(f"[DEBUG] 短信发送结果: success={result.get('success')}, method={result.get('method')}, error={result.get('error')}", "info")
             
             # 构建结果记录
             result_record = {
@@ -1086,7 +1351,7 @@ class SMSWorker(QThread):
                 'sim_card': f"卡{self.sim_slot + 1}",
                 'test_type': 'sms',
                 'sms_content': self.message,
-                'ping_status': '无',
+                'ping_status': f"{self.ping_sim.replace('使用', '').replace('进行Ping', '')} {ping_result}" if ping_success is not None else "无",
                 'call_result': '成功' if result['success'] else '失败',
                 'signal_status': '发送完成',
                 'signal_level': 0,
@@ -1096,22 +1361,36 @@ class SMSWorker(QThread):
             
             if result['success']:
                 if result.get('method') == 'intent':
-                    self.log_signal.emit("已打开短信应用，请手动确认发送", "warning")
-                    result_record['remark'] = '已打开短信应用，需手动发送'
+                    self.log_signal.emit("="*50, "info")
+                    self.log_signal.emit("📱 短信应用已打开", "warning")
+                    self.log_signal.emit("👉 请在手机上【手动点击发送按钮】", "warning")
+                    self.log_signal.emit("⏱️  等待30秒供您操作...", "warning")
+                    self.log_signal.emit("="*50, "info")
+                    result_record['remark'] = '已打开短信应用，需手动点击发送'
+                    self.result_signal.emit(result_record)
+                    # 给用户时间手动发送（等待30秒）
+                    for j in range(30):
+                        if not self.is_running:
+                            break
+                        self.status_signal.emit(f"等待手动发送... ({j+1}/30)")
+                        time.sleep(1)
+                    self.log_signal.emit("✅ 手动发送等待时间结束，继续下一次", "success")
                 else:
-                    self.log_signal.emit("短信发送成功", "success")
-                self.result_signal.emit(result_record)
+                    self.log_signal.emit("✅ 短信发送成功（后台自动发送）", "success")
+                    self.result_signal.emit(result_record)
             else:
-                self.log_signal.emit(f"短信发送失败: {result.get('error', 'Unknown error')}", "error")
+                error_msg = result.get('error', 'Unknown error')
+                self.log_signal.emit(f"❌ 短信发送失败: {error_msg}", "error")
+                self.log_signal.emit("[提示] 非root设备需要手动发送，请检查是否弹出短信应用", "warning")
                 self.result_signal.emit(result_record)
             
             if not self.is_running:
                 break
             
-            # 间隔2秒
-            if i < self.count:
-                self.log_signal.emit("等待2秒后进行下一次发送...", "info")
-                time.sleep(2)
+            # 等待间隔时间再进行下一次发送
+            if i < self.count and self.interval > 0:
+                self.log_signal.emit(f"等待{self.interval}秒后进行下一次发送...", "info")
+                time.sleep(self.interval)
         
         self.status_signal.emit("就绪")
         self.log_signal.emit(f"\n{'='*50}", "info")
@@ -1123,9 +1402,176 @@ class SMSWorker(QThread):
         # 这里可以通过信号通知主线程记录位置
         pass
     
+    def _run_ping_test(self) -> bool:
+        """执行 Ping 测试"""
+        if not self.ping_target:
+            return False
+        
+        self.log_signal.emit(f"[Ping] 正在测试 {self.ping_target}...", "info")
+        
+        try:
+            # 使用 adb shell ping
+            cmd = [
+                'adb', '-s', self.serial, 'shell',
+                'ping', '-c', '4', '-W', '2',  # 4次，超时2秒
+                self.ping_target
+            ]
+            
+            success, stdout, stderr = ADBHelper.execute_command(cmd, timeout=15)
+            
+            if success and stdout:
+                # 解析 ping 结果
+                import re
+                
+                # 检查是否有 "0% packet loss"
+                if '0% packet loss' in stdout or ' 0%' in stdout:
+                    self.log_signal.emit(f"[Ping] {self.ping_target} 成功 (0% 丢包)", "success")
+                    return True
+                else:
+                    # 提取丢包率
+                    match = re.search(r'(\d+)% packet loss', stdout)
+                    if match:
+                        loss = int(match.group(1))
+                        self.log_signal.emit(f"[Ping] {self.ping_target} 丢包率 {loss}%", "warning" if loss < 50 else "error")
+                        return loss < 50  # 丢包率小于50%认为成功
+                    else:
+                        # 检查是否有回复
+                        if 'bytes from' in stdout or 'icmp_seq' in stdout:
+                            self.log_signal.emit(f"[Ping] {self.ping_target} 有响应", "success")
+                            return True
+                        else:
+                            self.log_signal.emit(f"[Ping] {self.ping_target} 无响应", "error")
+                            return False
+            else:
+                self.log_signal.emit(f"[Ping] {self.ping_target} 测试失败", "error")
+                return False
+                
+        except Exception as e:
+            self.log_signal.emit(f"[Ping] 测试异常: {str(e)[:50]}", "error")
+            return False
+    
     def stop(self):
         """停止发送任务"""
         self.is_running = False
+
+
+class APLogWorker(QThread):
+    """AP Log 监控工作线程"""
+    
+    log_signal = pyqtSignal(str, str)  # 日志消息，类型(V/D/I/W/E)
+    status_signal = pyqtSignal(str)    # 状态更新
+    
+    def __init__(self, serial: str, log_level: str = 'V', tag_filter: str = ''):
+        super().__init__()
+        self.serial = serial
+        self.log_level = log_level
+        self.tag_filter = tag_filter
+        self.is_running = True
+        self.process = None
+    
+    def run(self):
+        """执行 logcat 监控"""
+        import subprocess
+        import re
+        
+        self.status_signal.emit("正在启动 logcat...")
+        
+        try:
+            # 构建 logcat 命令
+            # 先清除缓冲区，然后实时监控
+            cmd = ['adb', '-s', self.serial, 'logcat']
+            
+            # 添加日志级别过滤
+            if self.log_level != 'V':
+                cmd.extend(['*:' + self.log_level])
+            
+            # 添加标签过滤
+            if self.tag_filter:
+                tags = [t.strip() for t in self.tag_filter.split(',') if t.strip()]
+                for tag in tags:
+                    cmd.append(f'{tag}:{self.log_level}')
+            
+            # 先清除日志缓冲区
+            clear_cmd = ['adb', '-s', self.serial, 'logcat', '-c']
+            subprocess.run(clear_cmd, capture_output=True, timeout=5)
+            
+            self.status_signal.emit("logcat 已启动，正在监控...")
+            
+            # 启动 logcat 进程
+            startupinfo = None
+            if platform.system() == 'Windows':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                startupinfo=startupinfo
+            )
+            
+            # 解析日志格式: MM-DD HH:MM:SS.mmm PID TID L TAG: message
+            log_pattern = re.compile(
+                r'^(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+'  # 时间戳
+                r'(\d+)\s+'  # PID
+                r'(\d+)\s+'  # TID
+                r'([VDIWEF])\s+'  # 日志级别
+                r'([^:]+):\s*(.*)$'  # 标签和消息
+            )
+            
+            # 读取日志输出
+            while self.is_running and self.process.poll() is None:
+                line = self.process.stdout.readline()
+                if not line:
+                    continue
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 尝试解析日志格式
+                match = log_pattern.match(line)
+                if match:
+                    timestamp, pid, tid, level, tag, message = match.groups()
+                    # 格式化输出
+                    formatted = f"[{timestamp}] {level}/{tag}: {message}"
+                    self.log_signal.emit(formatted, level)
+                else:
+                    # 无法解析的行直接输出
+                    self.log_signal.emit(line, 'V')
+            
+            self.status_signal.emit("监控已停止")
+            
+        except subprocess.TimeoutExpired:
+            self.status_signal.emit("命令执行超时")
+        except FileNotFoundError:
+            self.status_signal.emit("ADB 未找到")
+        except Exception as e:
+            self.status_signal.emit(f"错误: {str(e)[:50]}")
+        finally:
+            self._cleanup()
+    
+    def stop(self):
+        """停止监控"""
+        self.is_running = False
+        self._cleanup()
+    
+    def _cleanup(self):
+        """清理资源"""
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+            self.process = None
 
 
 class StatusBadge(QLabel):
@@ -1630,6 +2076,21 @@ class MainWindow(QMainWindow):
         sims_layout.addWidget(sim2_frame, 1)
         
         sim_layout.addLayout(sims_layout)
+        
+        # 添加号码提示说明
+        number_tip = QLabel("💡 提示：号码从SIM卡读取，可能与您的实际号码不同")
+        number_tip.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['text_secondary']};
+                font-size: 11px;
+                padding: 8px;
+                background-color: {COLORS['primary_light']}15;
+                border-radius: 4px;
+            }}
+        """)
+        number_tip.setWordWrap(True)
+        sim_layout.addWidget(number_tip)
+        
         layout.addWidget(sim_card)
         
         # ===== 实时状态卡片 =====
@@ -1736,15 +2197,56 @@ class MainWindow(QMainWindow):
         # 开始/停止按钮
         btn_layout = QHBoxLayout()
         
-        self.start_btn = IconButton(ICONS['start'], "开始", COLORS['success'])
+        # 使用普通 QPushButton 而不是 IconButton，避免阴影效果拦截点击事件
+        self.start_btn = QPushButton(f"{ICONS['start']} 开始")
         self.start_btn.setMinimumHeight(45)
         self.start_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        self.start_btn.clicked.connect(self.start_calling)
+        self.start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: white;
+                padding: 12px 24px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 8px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['success']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['success']}bb;
+            }}
+            QPushButton:disabled {{
+                background-color: {COLORS['text_secondary']}60;
+            }}
+        """)
+        self.start_btn.clicked.connect(self._on_start_btn_clicked)
         btn_layout.addWidget(self.start_btn)
         
-        self.stop_btn = IconButton(ICONS['stop'], "停止", COLORS['error'])
+        self.stop_btn = QPushButton(f"{ICONS['stop']} 停止")
         self.stop_btn.setMinimumHeight(45)
         self.stop_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        self.stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['error']};
+                color: white;
+                padding: 12px 24px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 8px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['error']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['error']}bb;
+            }}
+            QPushButton:disabled {{
+                background-color: {COLORS['text_secondary']}60;
+            }}
+        """)
         self.stop_btn.clicked.connect(self.stop_calling)
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
@@ -1779,14 +2281,12 @@ class MainWindow(QMainWindow):
         
         # 标题行 - SIM卡名称和状态
         header = QHBoxLayout()
-        sim_title = QLabel(f"{ICONS['sim']} {sim_name}")
-        sim_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        sim_title.setStyleSheet(f"color: {COLORS['text_primary']};")
+        sim_title = QLabel(sim_name)
+        sim_title.setStyleSheet(f"color: {COLORS['text_primary']}; font-weight: bold;")
         header.addWidget(sim_title)
         header.addStretch()
         
         status_badge = StatusBadge("未插入", "default")
-        status_badge.setStyleSheet(status_badge.styleSheet().replace("padding: 4px 10px", "padding: 2px 8px"))
         setattr(self, f"{sim_id}_status_badge", status_badge)
         header.addWidget(status_badge)
         layout.addLayout(header)
@@ -1804,57 +2304,51 @@ class MainWindow(QMainWindow):
         
         # 运营商
         op_layout = QHBoxLayout()
-        op_layout.addWidget(QLabel(f"{ICONS['signal']} 运营商"))
+        op_label = QLabel("运营商:")
+        op_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        op_layout.addWidget(op_label)
         operator_label = QLabel("--")
         operator_label.setStyleSheet(info_style)
-        operator_label.setMinimumWidth(80)
         setattr(self, f"{sim_id}_operator_label", operator_label)
         op_layout.addWidget(operator_label, 1)
         layout.addLayout(op_layout)
         
         # 手机号
         num_layout = QHBoxLayout()
-        num_layout.addWidget(QLabel(f"{ICONS['call']} 号码"))
+        num_label = QLabel("号码:")
+        num_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        num_layout.addWidget(num_label)
         number_label = QLabel("--")
         number_label.setStyleSheet(info_style)
-        number_label.setMinimumWidth(80)
         setattr(self, f"{sim_id}_number_label", number_label)
         num_layout.addWidget(number_label, 1)
         layout.addLayout(num_layout)
         
         # 信号强度
+        # 信号强度 - 简化显示
         sig_layout = QHBoxLayout()
-        sig_layout.addWidget(QLabel(f"{ICONS['wifi']} 信号"))
+        sig_text = QLabel("信号:")
+        sig_text.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        sig_layout.addWidget(sig_text)
         
-        signal_frame = QFrame()
-        signal_layout = QHBoxLayout(signal_frame)
-        signal_layout.setSpacing(2)
-        signal_layout.setContentsMargins(0, 0, 0, 0)
+        signal_value = QLabel("--")
+        signal_value.setStyleSheet(info_style)
+        setattr(self, f"{sim_id}_signal_value", signal_value)
+        sig_layout.addWidget(signal_value, 1)
         
+        # 保留信号条引用用于兼容，但不显示
         signal_bars = []
-        for i in range(4):
-            bar = QFrame()
-            bar.setFixedSize(4, 8 + i * 3)
-            bar.setStyleSheet(f"background-color: {COLORS['divider']}; border-radius: 1px;")
-            signal_layout.addWidget(bar)
-            signal_bars.append(bar)
         setattr(self, f"{sim_id}_signal_bars", signal_bars)
         
-        signal_value = QLabel("无")
-        signal_value.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10px;")
-        setattr(self, f"{sim_id}_signal_value", signal_value)
-        signal_layout.addWidget(signal_value)
-        signal_layout.addStretch()
-        
-        sig_layout.addWidget(signal_frame)
         layout.addLayout(sig_layout)
         
         # 网络类型
         net_layout = QHBoxLayout()
-        net_layout.addWidget(QLabel(f"{ICONS['network']} 网络"))
+        net_text = QLabel("网络:")
+        net_text.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        net_layout.addWidget(net_text)
         network_label = QLabel("--")
         network_label.setStyleSheet(info_style)
-        network_label.setMinimumWidth(50)
         setattr(self, f"{sim_id}_network_label", network_label)
         net_layout.addWidget(network_label, 1)
         layout.addLayout(net_layout)
@@ -1935,7 +2429,11 @@ class MainWindow(QMainWindow):
         self.map_tab = self._create_map_tab()
         self.tab_widget.addTab(self.map_tab, f"{ICONS['map']} 地图打点")
         
-        # ===== Tab 5: ADB 终端 =====
+        # ===== Tab 5: AP Log =====
+        self.aplog_tab = self._create_aplog_tab()
+        self.tab_widget.addTab(self.aplog_tab, "📜 AP Log")
+        
+        # ===== Tab 6: ADB 终端 =====
         self.adb_tab = self._create_adb_tab()
         self.tab_widget.addTab(self.adb_tab, "🖥️ ADB终端")
         
@@ -1963,16 +2461,38 @@ class MainWindow(QMainWindow):
         header.addStretch()
         
         # 脚本操作按钮
-        self.run_script_btn = IconButton(ICONS['run'], "开始测试", COLORS['success'])
-        self.run_script_btn.setStyleSheet(self.run_script_btn.styleSheet().replace("12px 24px", "8px 16px"))
+        self.run_script_btn = QPushButton(f"{ICONS['run']} 开始测试")
+        self.run_script_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: white;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['success']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['success']}bb;
+            }}
+            QPushButton:disabled {{
+                background-color: {COLORS['text_secondary']}60;
+            }}
+        """)
+        self.run_script_btn.clicked.connect(self._on_start_btn_clicked)
         header.addWidget(self.run_script_btn)
         
         self.save_strategy_btn = IconButton(ICONS['save'], "保存策略", COLORS['primary'])
         self.save_strategy_btn.setStyleSheet(self.save_strategy_btn.styleSheet().replace("12px 24px", "8px 16px"))
+        self.save_strategy_btn.clicked.connect(self._save_strategies)
         header.addWidget(self.save_strategy_btn)
         
         self.load_strategy_btn = IconButton(ICONS['refresh'], "加载策略", COLORS['info'])
         self.load_strategy_btn.setStyleSheet(self.load_strategy_btn.styleSheet().replace("12px 24px", "8px 16px"))
+        self.load_strategy_btn.clicked.connect(self._load_strategies)
         header.addWidget(self.load_strategy_btn)
         
         layout.addLayout(header)
@@ -2129,6 +2649,16 @@ class MainWindow(QMainWindow):
         self.call_count_spin.setStyleSheet(self.call_duration_spin.styleSheet())
         config_layout.addWidget(self.call_count_spin)
         
+        # 通话间隔
+        config_layout.addWidget(QLabel("间隔:"))
+        self.call_interval_spin = QSpinBox()
+        self.call_interval_spin.setRange(0, 300)
+        self.call_interval_spin.setValue(2)
+        self.call_interval_spin.setSuffix(" 秒")
+        self.call_interval_spin.setToolTip("每次通话/短信之间的间隔时间（秒），0表示无间隔")
+        self.call_interval_spin.setStyleSheet(self.call_duration_spin.styleSheet())
+        config_layout.addWidget(self.call_interval_spin)
+        
         config_layout.addStretch()
         strategy_layout.addLayout(config_layout)
         
@@ -2248,11 +2778,12 @@ class MainWindow(QMainWindow):
         self.sms_content_label.setVisible(is_sms)
         self.sms_content_input.setVisible(is_sms)
         
-        # 更新Ping选项的可见性（短信模式下不需要Ping）
+        # 更新Ping选项的可见性（短信和电话都支持Ping）
+        # 短信和电话测试都支持并发Ping功能
         if hasattr(self, 'ping_check'):
-            self.ping_check.setVisible(not is_sms)
-            self.ping_sim_combo.setVisible(not is_sms)
-            self.ping_target_input.setVisible(not is_sms)
+            self.ping_check.setVisible(True)
+            self.ping_sim_combo.setVisible(True)
+            self.ping_target_input.setVisible(True)
     
     def _toggle_ping(self, event=None):
         """切换 Ping 选项"""
@@ -2289,19 +2820,34 @@ class MainWindow(QMainWindow):
         # 获取目标号码
         target_num = ""
         if target == "目标卡一":
-            target_num = self.target_sim1_input.text() or "未设置"
+            target_num = self.target_sim1_input.text().strip()
+            if not target_num:
+                QMessageBox.warning(self, f"{ICONS['warning']} 警告", "请先设置目标卡一的号码！\n\n请在右侧\"目标手机设置\"区域输入目标号码。")
+                return
         elif target == "目标卡二":
-            target_num = self.target_sim2_input.text() or "未设置"
+            target_num = self.target_sim2_input.text().strip()
+            if not target_num:
+                QMessageBox.warning(self, f"{ICONS['warning']} 警告", "请先设置目标卡二的号码！\n\n请在右侧\"目标手机设置\"区域输入目标号码。")
+                return
         else:  # 双卡轮流
-            target_num = f"卡一({self.target_sim1_input.text() or '未设置'}) / 卡二({self.target_sim2_input.text() or '未设置'})"
+            sim1_num = self.target_sim1_input.text().strip()
+            sim2_num = self.target_sim2_input.text().strip()
+            if not sim1_num and not sim2_num:
+                QMessageBox.warning(self, f"{ICONS['warning']} 警告", "请至少设置一个目标号码！\n\n请在右侧\"目标手机设置\"区域输入目标号码。")
+                return
+            target_num = f"卡一({sim1_num or '未设置'}) / 卡二({sim2_num or '未设置'})"
         
         # 构建策略描述
         ping_info = ""
-        if test_type == "call" and self.ping_enabled:
+        if self.ping_enabled:
             ping_sim = self.ping_sim_combo.currentText().replace("使用", "").replace("进行Ping", "")
             ping_target = self.ping_target_input.text()
             ping_info = f" + {ping_sim}Ping[{ping_target}]"
         
+        # 获取间隔时间
+        interval = self.call_interval_spin.value()
+        
+        # 短信和电话测试都支持Ping功能
         strategy = {
             'test_type': test_type,
             'local_sim': local_sim,
@@ -2309,10 +2855,11 @@ class MainWindow(QMainWindow):
             'target_num': target_num,
             'duration': duration,
             'count': count,
+            'interval': interval,  # 通话/发送间隔（秒）
             'sms_content': sms_content,
-            'ping_enabled': self.ping_enabled if test_type == "call" else False,
-            'ping_sim': self.ping_sim_combo.currentText() if self.ping_enabled and test_type == "call" else "",
-            'ping_target': self.ping_target_input.text() if self.ping_enabled and test_type == "call" else ""
+            'ping_enabled': self.ping_enabled,  # 短信和电话都支持Ping
+            'ping_sim': self.ping_sim_combo.currentText() if self.ping_enabled else "",
+            'ping_target': self.ping_target_input.text() if self.ping_enabled else ""
         }
         
         self.strategies.append(strategy)
@@ -2367,12 +2914,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(num_label)
         
         # 参数（根据测试类型显示不同信息）
+        interval = strategy.get('interval', 2)
+        interval_str = f" 间隔{interval}秒" if interval > 0 else " 无间隔"
+        
         if is_sms:
             sms_preview = strategy.get('sms_content', '')[:20] + "..." if len(strategy.get('sms_content', '')) > 20 else strategy.get('sms_content', '')
-            params = QLabel(f"短信: {sms_preview} × {strategy['count']}次")
+            params = QLabel(f"短信: {sms_preview} × {strategy['count']}次{interval_str}")
             params.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
         else:
-            params = QLabel(f"通话{strategy['duration']}秒 × {strategy['count']}次")
+            params = QLabel(f"通话{strategy['duration']}秒 × {strategy['count']}次{interval_str}")
             params.setStyleSheet(f"color: {COLORS['info']}; font-size: 12px;")
         layout.addWidget(params)
         
@@ -2898,11 +3448,17 @@ class MainWindow(QMainWindow):
                 }}
             """)
             
-            # Windows 下配置 WebEngine 以允许本地文件访问
+            # 配置 WebEngine 以允许本地文件访问（所有平台）
             settings = self.map_view.settings()
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            
+            # macOS 需要额外配置
+            if platform.system() == 'Darwin':
+                settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+                # 设置默认字体
+                settings.setFontFamily(QWebEngineSettings.FontFamily.StandardFont, "-apple-system")
             
             # 初始化空白地图
             self._init_empty_map()
@@ -2974,6 +3530,16 @@ class MainWindow(QMainWindow):
         self.export_map_btn.clicked.connect(self._export_location_tracks)
         btn_layout.addWidget(self.export_map_btn)
         
+        self.screenshot_btn = IconButton("📷", "保存截图", COLORS['success'])
+        self.screenshot_btn.setStyleSheet(self.screenshot_btn.styleSheet().replace("12px 24px", "8px 16px"))
+        self.screenshot_btn.clicked.connect(self._save_map_screenshot)
+        btn_layout.addWidget(self.screenshot_btn)
+        
+        self.save_html_btn = IconButton("🌐", "保存网页", COLORS['info'])
+        self.save_html_btn.setStyleSheet(self.save_html_btn.styleSheet().replace("12px 24px", "8px 16px"))
+        self.save_html_btn.clicked.connect(self._save_map_html)
+        btn_layout.addWidget(self.save_html_btn)
+        
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
@@ -2999,62 +3565,77 @@ class MainWindow(QMainWindow):
         self.current_location_display.setText(f"{ICONS['location']} {location}")
     
     def _get_device_location(self) -> str:
-        """获取设备位置信息 - 优先获取GPS坐标"""
+        """获取设备位置信息 - 优先获取GPS/网络位置"""
         if not self.current_device:
             return "未连接设备"
         try:
-            # 方法1: 尝试获取GPS位置（最准确）
+            # 方法1: 从dumpsys location获取最后已知位置
             success, stdout, _ = ADBHelper.execute_command(
                 ['adb', '-s', self.current_device.serial, 'shell', 'dumpsys', 'location'],
                 timeout=5
             )
             if success and stdout:
+                import re
+                # 格式: last location=Location[network 40.01****,116.46**** hAcc=35.0 ...]
+                match = re.search(r'last location=Location\[\w+\s+(-?\d+\.\d+)\*+,(-?\d+\.\d+)\*+', stdout)
+                if match:
+                    lat = float(match.group(1))
+                    lon = float(match.group(2))
+                    return f"lat={lat},lon={lon}"
+                
+                # 备用格式: Location[network lat,lon ...]
+                match = re.search(r'Location\[\w+\s+(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)', stdout)
+                if match:
+                    lat = float(match.group(1))
+                    lon = float(match.group(2))
+                    return f"lat={lat},lon={lon}"
+                
+                # 查找包含经纬度的行
                 lines = stdout.strip().split('\n')
                 for line in lines:
                     line_lower = line.lower()
-                    # 查找包含经纬度的行
                     if ('latitude' in line_lower and 'longitude' in line_lower) or \
                        ('lat=' in line_lower and 'lon=' in line_lower):
-                        # 尝试提取坐标
-                        import re
                         lat_match = re.search(r'lat(?:itude)?[=:]\s*(-?\d+\.\d+)', line, re.I)
                         lon_match = re.search(r'lon(?:gitude)?[=:]\s*(-?\d+\.\d+)', line, re.I)
                         if lat_match and lon_match:
                             lat = float(lat_match.group(1))
                             lon = float(lon_match.group(1))
                             return f"lat={lat},lon={lon}"
-                        return line.strip()[:80]
             
-            # 方法2: 使用 settings 获取最后已知位置
-            success, stdout, _ = ADBHelper.execute_command(
-                ['adb', '-s', self.current_device.serial, 'shell', 'settings', 'get', 'secure', 'location_providers_allowed'],
-                timeout=3
-            )
-            if success and 'gps' in stdout.lower():
-                # GPS已启用，尝试获取更精确位置
-                pass
-            
-            # 方法3: 尝试获取基站位置（粗略）
+            # 方法2: 尝试获取基站位置
             success, stdout, _ = ADBHelper.execute_command(
                 ['adb', '-s', self.current_device.serial, 'shell', 'dumpsys', 'telephony.registry'],
                 timeout=5
             )
             if success and stdout:
-                lines = stdout.strip().split('\n')
-                for line in lines:
-                    if 'mCellIdentity' in line:
-                        # 提取基站信息
-                        return f"cell:{line.strip()[:60]}"
+                # 查找CellIdentity获取基站位置
+                match = re.search(r'CellIdentityNr:\{[^}]*mNci\s*=\s*(\d+)', stdout)
+                if match:
+                    return "基站位置(5G)"
+                match = re.search(r'CellIdentityLte:\{[^}]*mCi\s*=\s*(\d+)', stdout)
+                if match:
+                    return "基站位置(4G)"
             
             return "位置信息暂时不可用"
         except Exception as e:
             return f"获取失败: {str(e)[:30]}"
     
+    @pyqtSlot(str, int, int)
     def _record_call_location(self, phone_number: str, call_index: int, total_calls: int):
         """记录通话位置（在电话接通时调用）"""
+        print(f"\n[DEBUG Location] ====== 位置记录函数被调用 ======")
+        print(f"[DEBUG Location] 参数: phone={phone_number}, index={call_index}/{total_calls}")
+        
         from datetime import datetime
         timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        print(f"[DEBUG Location] 检查UI组件...")
+        print(f"[DEBUG Location] location_list存在: {hasattr(self, 'location_list')}")
+        print(f"[DEBUG Location] location_records存在: {hasattr(self, 'location_records')}")
+        
         location_str = self._get_device_location()
+        print(f"[DEBUG Location] 获取位置: {location_str}")
         
         record = {
             'timestamp': timestamp,
@@ -3064,11 +3645,20 @@ class MainWindow(QMainWindow):
             'total_calls': total_calls
         }
         self.location_records.append(record)
+        print(f"[DEBUG Location] 记录已添加，当前记录数: {len(self.location_records)}")
         
         # 更新显示
         self._update_location_display()
-        record_text = f"[{timestamp}] 拨打: {phone_number} | {location_str[:40]}\n"
-        self.location_list.append(record_text)
+        record_text = f"[{timestamp}] 拨打: {phone_number} | {location_str[:40]}"
+        
+        # 使用 insertPlainText 代替 append 确保内容被添加
+        from PyQt6.QtGui import QTextCursor
+        cursor = self.location_list.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.location_list.setTextCursor(cursor)
+        self.location_list.insertPlainText(record_text + "\n")
+        
+        print(f"[DEBUG Location] 已添加到列表显示: {record_text}")
         
         # 更新状态
         self.location_count_label.setText(f"通话记录: {len(self.location_records)}")
@@ -3076,30 +3666,221 @@ class MainWindow(QMainWindow):
         self.location_status.set_status("success")
     
     def _init_empty_map(self):
-        """初始化空白地图"""
+        """初始化空白地图 - 优先使用设备实际位置"""
         if not WEB_ENGINE_AVAILABLE:
             self.map_view.setText("地图功能需要 PyQt6-WebEngine\n\n请运行: pip install PyQt6-WebEngine folium")
             return
         
-        # 创建以北京为中心的地图
+        # 尝试获取设备当前位置
+        current_location = None
+        location_info = "等待通话位置记录..."
+        
+        if hasattr(self, 'current_device') and self.current_device:
+            location_str = self._get_device_location()
+            coords = self._parse_location_coords(location_str)
+            if coords:
+                current_location = coords
+                location_info = f"当前设备位置\n{location_str[:50]}"
+                print(f"[DEBUG] 地图初始化使用实际位置: {coords}")
+            else:
+                print(f"[DEBUG] 无法获取实际位置，使用默认位置。location_str={location_str}")
+        
+        # 使用实际位置或默认位置（北京中心）
+        if current_location:
+            lat, lng = current_location
+            zoom = 15  # 有实际位置时用更近的缩放级别
+        else:
+            lat, lng = 39.9042, 116.4074  # 北京中心
+            zoom = 12
+        
+        # macOS使用简化地图（iframe方案更可靠）
+        if platform.system() == 'Darwin':
+            self._load_simple_map(lat, lng, zoom, location_info)
+            return
+        
+        # Windows/Linux使用folium，但改用高德瓦片
         m = folium.Map(
-            location=[39.9042, 116.4074],
-            zoom_start=12,
-            tiles='OpenStreetMap'
+            location=[lat, lng],
+            zoom_start=zoom,
+            tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+            attr='高德地图'
         )
         
-        # 添加提示标记
-        folium.Marker(
-            [39.9042, 116.4074],
-            popup='等待通话位置记录...',
-            icon=folium.Icon(color='gray', icon='info-sign')
+        # 添加提示标记（使用CircleMarker，不依赖外部图标）
+        marker_color = 'blue' if current_location else 'gray'
+        folium.CircleMarker(
+            [lat, lng],
+            radius=10,
+            color=marker_color,
+            fill=True,
+            fillColor=marker_color,
+            fillOpacity=0.6,
+            popup=location_info.replace('\n', '<br>')
         ).add_to(m)
         
         # 保存并加载
         self._load_map_to_view(m)
     
+    def _load_simple_map(self, lat: float, lng: float, zoom: int = 15, info_text: str = ""):
+        """加载简化地图（使用国内CDN + 高德瓦片，中国可用）"""
+        if not WEB_ENGINE_AVAILABLE:
+            return
+        
+        info_html = f"<strong>📍 {info_text}</strong><br>纬度: {lat:.4f}<br>经度: {lng:.4f}" if info_text else f"纬度: {lat:.4f}<br>经度: {lng:.4f}"
+        
+        # 使用 Leaflet + 国内CDN(bootcdn) + 高德瓦片（无需API key）
+        map_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>通话位置地图</title>
+    <!-- 国内CDN: bootcdn -->
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.css">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            overflow: hidden;
+        }}
+        #map {{ width: 100%; height: 100vh; }}
+        .info {{ 
+            position: absolute; 
+            top: 10px; 
+            right: 10px; 
+            background: rgba(255,255,255,0.95); 
+            padding: 12px; 
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            z-index: 1000;
+            font-size: 13px;
+            max-width: 220px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="info">{info_html}</div>
+    <div id="map"></div>
+    
+    <script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{lat}, {lng}], {zoom});
+        
+        // 高德瓦片（无需API key，国内可访问）
+        L.tileLayer('https://webrd0{{s}}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={{x}}&y={{y}}&z={{z}}', {{
+            subdomains: '1234',
+            attribution: '&copy; 高德地图'
+        }}).addTo(map);
+        
+        L.marker([{lat}, {lng}]).addTo(map)
+            .bindPopup('<b>通话位置</b>')
+            .openPopup();
+    </script>
+</body>
+</html>"""
+        
+        self.map_view.setHtml(map_html)
+        print(f"[DEBUG] 加载简化地图: {lat}, {lng} (国内CDN+高德瓦片)")
+    
+    def _load_simple_map_multi(self, coords_list: list):
+        """加载多位置地图（macOS/中国可用）
+        
+        Args:
+            coords_list: 坐标列表，每项为 {'lat': float, 'lng': float, 'phone': str, 'time': str, 'index': int}
+        """
+        if not WEB_ENGINE_AVAILABLE or not coords_list:
+            return
+        
+        # 计算中心点
+        center_lat = coords_list[0]['lat']
+        center_lng = coords_list[0]['lng']
+        
+        # 生成标记点JavaScript代码
+        markers_js = []
+        colors = ['red', 'blue', 'green', 'orange', 'purple', 'darkred', 'darkblue', 'darkgreen']
+        
+        for i, coord in enumerate(coords_list):
+            color = colors[i % len(colors)]
+            markers_js.append(f"""
+                var marker{i} = L.circleMarker([{coord['lat']}, {coord['lng']}],
+                    {{color: '{color}', fillColor: '{color}', fillOpacity: 0.8, radius: 8}}
+                ).addTo(map);
+                marker{i}.bindPopup('<b>通话 #{coord['index']}</b><br>号码: {coord['phone']}<br>时间: {coord['time']}');
+            """)
+        
+        markers_script = "\n".join(markers_js)
+        
+        # 如果有多个点，计算合适的zoom并添加连线
+        fit_bounds_js = ""
+        if len(coords_list) > 1:
+            bounds = [[c['lat'], c['lng']] for c in coords_list]
+            fit_bounds_js = f"map.fitBounds({bounds}, {{padding: [50, 50]}});"
+            
+            # 添加连线
+            points = [[c['lat'], c['lng']] for c in coords_list]
+            markers_script += f"""
+                var path = L.polyline({points}, {{
+                    color: '#2196F3',
+                    weight: 3,
+                    opacity: 0.7,
+                    dashArray: '5, 10'
+                }}).addTo(map);
+            """
+        
+        info_html = f"<strong>📍 通话记录</strong><br>共 {len(coords_list)} 个位置"
+        
+        map_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>通话位置地图</title>
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.css">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            overflow: hidden;
+        }}
+        #map {{ width: 100%; height: 100vh; }}
+        .info {{ 
+            position: absolute; 
+            top: 10px; 
+            right: 10px; 
+            background: rgba(255,255,255,0.95); 
+            padding: 12px; 
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            z-index: 1000;
+            font-size: 13px;
+            max-width: 220px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="info">{info_html}</div>
+    <div id="map"></div>
+    
+    <script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{center_lat}, {center_lng}], 15);
+        
+        L.tileLayer('https://webrd0{{s}}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={{x}}&y={{y}}&z={{z}}', {{
+            subdomains: '1234',
+            attribution: '&copy; 高德地图'
+        }}).addTo(map);
+        
+        {markers_script}
+        {fit_bounds_js}
+    </script>
+</body>
+</html>"""
+        
+        self.map_view.setHtml(map_html)
+        print(f"[DEBUG] 加载多位置地图: {len(coords_list)} 个点 (国内CDN+高德瓦片)")
+    
     def _load_map_to_view(self, map_obj):
-        """将 Folium 地图加载到 QWebEngineView - Windows 兼容版"""
+        """将 Folium 地图加载到 QWebEngineView - 跨平台兼容版"""
         if not WEB_ENGINE_AVAILABLE:
             return
         
@@ -3120,25 +3901,82 @@ class MainWindow(QMainWindow):
             # 保存地图
             map_obj.save(map_path)
             
-            # 转换为 QUrl（Windows 需要 file:/// 格式）
+            # 验证文件是否创建成功
+            if not os.path.exists(map_path):
+                raise RuntimeError(f"地图文件未创建: {map_path}")
+            
+            # 读取并修复HTML内容（解决跨域问题）
+            with open(map_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            
+            # 在<head>中添加CSP（内容安全策略）允许加载外部资源
+            csp_meta = '<meta http-equiv="Content-Security-Policy" content="default-src *; script-src * \'unsafe-inline\' \'unsafe-eval\'; style-src * \'unsafe-inline\'; img-src * data: blob:; connect-src *;">'
+            if '<head>' in html_content:
+                html_content = html_content.replace('<head>', f'<head>{csp_meta}')
+            
+            # 重新写入修复后的HTML
+            with open(map_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            # 设置 WebEngine 属性（所有平台）
+            settings = self.map_view.settings()
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.SpatialNavigationEnabled, True)
+            
+            # 连接加载完成信号
+            try:
+                self.map_view.loadFinished.disconnect()
+            except:
+                pass
+            self.map_view.loadFinished.connect(self._on_map_load_finished)
+            
+            # 加载地图 - 所有平台都使用本地文件URL
             map_url = QUrl.fromLocalFile(map_path)
+            print(f"[DEBUG] 加载地图: {map_url.toString()}")
             self.map_view.load(map_url)
             
             # 清理旧文件（保留最近10个）
             self._cleanup_old_maps(temp_dir)
             
         except Exception as e:
-            print(f"地图加载失败: {e}")
+            print(f"[ERROR] 地图加载失败: {e}")
+            import traceback
+            traceback.print_exc()
             # 显示错误信息在地图上
             self.map_view.setHtml(f"""
-                <html><body style="font-family: sans-serif; padding: 20px;">
+                <html>
+                <head><meta charset="UTF-8"></head>
+                <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px;">
                     <h3>地图加载失败</h3>
                     <p>错误信息: {str(e)}</p>
+                    <p>平台: {platform.system()}</p>
                     <p>请确保:</p>
                     <ul>
-                        <li>系统已安装 WebView2 运行时</li>
+                        <li>系统已安装 WebEngine 支持</li>
                         <li>有网络连接加载地图</li>
                         <li>临时目录可写入</li>
+                    </ul>
+                    <p>临时目录: {tempfile.gettempdir()}</p>
+                </body></html>
+            """)
+    
+    def _on_map_load_finished(self, success):
+        """地图加载完成回调"""
+        if success:
+            print("[DEBUG] 地图加载成功")
+        else:
+            print("[ERROR] 地图加载失败")
+            # 显示错误信息
+            self.map_view.setHtml("""
+                <html><body style="padding: 20px; font-family: sans-serif;">
+                    <h3>地图加载失败</h3>
+                    <p>无法加载地图内容，请检查:</p>
+                    <ul>
+                        <li>网络连接是否正常</li>
+                        <li>是否安装了 WebEngine</li>
                     </ul>
                 </body></html>
             """)
@@ -3190,27 +4028,38 @@ class MainWindow(QMainWindow):
             self._init_empty_map()
             return
         
-        # 创建地图，中心点为第一个有效位置
+        # macOS使用简化地图（支持多点）
+        if platform.system() == 'Darwin':
+            self._load_simple_map_multi(valid_coords)
+            return
+        
+        # Windows/Linux使用folium，但改用高德瓦片
         center_lat = valid_coords[0]['lat']
         center_lng = valid_coords[0]['lng']
         
+        # 使用高德瓦片（中国可用）
         m = folium.Map(
             location=[center_lat, center_lng],
             zoom_start=15,
-            tiles='OpenStreetMap'
+            tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+            attr='高德地图'
         )
         
-        # 添加标记点
+        # 添加标记点（不使用Font Awesome，避免外部CDN依赖）
         for i, coord in enumerate(valid_coords):
-            # 根据索引选择颜色
             colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'darkblue', 'darkgreen']
             color = colors[i % len(colors)]
             
-            folium.Marker(
+            # 使用CircleMarker而不是Font Awesome图标
+            folium.CircleMarker(
                 [coord['lat'], coord['lng']],
+                radius=8,
+                color=color,
+                fill=True,
+                fillColor=color,
+                fillOpacity=0.8,
                 popup=f"通话 #{coord['index']}<br>号码: {coord['phone']}<br>时间: {coord['time']}",
-                tooltip=f"通话 #{coord['index']}",
-                icon=folium.Icon(color=color, icon='phone', prefix='fa')
+                tooltip=f"通话 #{coord['index']}"
             ).add_to(m)
         
         # 如果有多个点，添加连线
@@ -3319,6 +4168,404 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "成功", f"已导出到:\n{filename}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
+    
+    def _save_map_screenshot(self):
+        """保存地图截图"""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from PyQt6.QtCore import QTimer
+        from datetime import datetime
+        
+        if not self.location_records:
+            QMessageBox.information(self, "提示", "没有位置记录，无法截图")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "保存地图截图",
+            f"map_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            "PNG Images (*.png);;JPEG Images (*.jpg)"
+        )
+        
+        if filename:
+            # 延迟截图，确保地图渲染完成
+            QTimer.singleShot(500, lambda: self._capture_map(filename))
+    
+    def _capture_map(self, filename: str):
+        """捕获地图截图"""
+        from PyQt6.QtWidgets import QMessageBox
+        from PyQt6.QtGui import QPixmap
+        
+        try:
+            if WEB_ENGINE_AVAILABLE:
+                # 截图 WebEngineView
+                pixmap = self.map_view.grab()
+            else:
+                # 文本模式也尝试截图
+                pixmap = self.map_view.grab()
+            
+            if pixmap.save(filename):
+                QMessageBox.information(self, "成功", f"截图已保存:\\n{filename}")
+            else:
+                QMessageBox.critical(self, "错误", "保存截图失败")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"截图失败: {str(e)}")
+    
+    def _save_map_html(self):
+        """保存地图为HTML文件，可在浏览器中打开"""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from datetime import datetime
+        import os
+        import tempfile
+        
+        if not self.location_records:
+            QMessageBox.information(self, "提示", "没有位置记录，无法保存")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "保存地图网页",
+            f"map_track_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+            "HTML Files (*.html)"
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            # 获取当前地图的HTML内容
+            if WEB_ENGINE_AVAILABLE:
+                # 尝试从临时目录找到最新的地图文件
+                temp_dir = os.path.join(tempfile.gettempdir(), 'phone_tester')
+                if os.path.exists(temp_dir):
+                    import glob
+                    map_files = glob.glob(os.path.join(temp_dir, 'map_*.html'))
+                    if map_files:
+                        # 复制最新的地图文件
+                        latest_map = max(map_files, key=os.path.getmtime)
+                        import shutil
+                        shutil.copy2(latest_map, filename)
+                        QMessageBox.information(self, "成功", f"地图网页已保存:\\n{filename}")
+                        return
+            
+            # 如果没有找到，生成一个新的HTML
+            self._generate_map_html(filename)
+            QMessageBox.information(self, "成功", f"地图网页已保存:\\n{filename}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+    
+    def _generate_map_html(self, filename: str):
+        """生成包含所有位置记录的HTML地图"""
+        from datetime import datetime
+        
+        # 解析坐标
+        valid_coords = []
+        for record in self.location_records:
+            coords = self._parse_location_coords(record['location'])
+            if coords:
+                valid_coords.append({
+                    'lat': coords[0],
+                    'lng': coords[1],
+                    'phone': record['phone_number'],
+                    'time': record['timestamp'],
+                    'index': record['call_index']
+                })
+        
+        if not valid_coords:
+            raise ValueError("没有有效坐标")
+        
+        center_lat = valid_coords[0]['lat']
+        center_lng = valid_coords[0]['lng']
+        
+        # 生成标记点JavaScript
+        markers_js = []
+        colors = ['red', 'blue', 'green', 'orange', 'purple', 'darkred', 'darkblue', 'darkgreen']
+        for i, coord in enumerate(valid_coords):
+            color = colors[i % len(colors)]
+            markers_js.append(f"""
+                var marker{i} = L.circleMarker([{coord['lat']}, {coord['lng']}],
+                    {{color: '{color}', fillColor: '{color}', fillOpacity: 0.8, radius: 10}}
+                ).addTo(map);
+                marker{i}.bindPopup('<b>通话 #{coord['index']}</b><br>📞 {coord['phone']}<br>🕐 {coord['time']}');
+            """)
+        
+        markers_script = "\\n".join(markers_js)
+        
+        # 添加连线
+        if len(valid_coords) > 1:
+            points = [[c['lat'], c['lng']] for c in valid_coords]
+            markers_script += f"""
+                var path = L.polyline({points}, {{
+                    color: '#2196F3',
+                    weight: 4,
+                    opacity: 0.8,
+                    dashArray: '8, 8'
+                }}).addTo(map);
+            """
+            fit_bounds = f"map.fitBounds({[[c['lat'], c['lng']] for c in valid_coords]}, {{padding: [80, 80]}});"
+        else:
+            fit_bounds = ""
+        
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>通话测试轨迹 - {len(valid_coords)}个位置</title>
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.css">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }}
+        #map {{ width: 100%; height: 100vh; }}
+        .header {{
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            background: rgba(255,255,255,0.95);
+            padding: 15px 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            z-index: 1000;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .header h1 {{ font-size: 18px; color: #333; margin: 0; }}
+        .header .info {{ font-size: 14px; color: #666; }}
+        .legend {{
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(255,255,255,0.95);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            z-index: 1000;
+            font-size: 12px;
+            max-width: 250px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>📞 通话测试轨迹</h1>
+            <div class="info">共 {len(valid_coords)} 个通话位置 | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>
+    </div>
+    <div id="map"></div>
+    <div class="legend">
+        <strong>图例</strong><br>
+        ● 红色: 第1个通话<br>
+        ● 蓝色: 第2个通话<br>
+        ● 绿色: 第3个通话<br>
+        ● 其他颜色: 后续通话<br>
+        — 蓝色虚线: 移动轨迹
+    </div>
+    
+    <script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([{center_lat}, {center_lng}], 15);
+        
+        L.tileLayer('https://webrd0{{s}}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={{x}}&y={{y}}&z={{z}}', {{
+            subdomains: '1234',
+            attribution: '&copy; 高德地图'
+        }}).addTo(map);
+        
+        {markers_script}
+        {fit_bounds}
+    </script>
+</body>
+</html>"""
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+    def _create_aplog_tab(self) -> QWidget:
+        """创建 AP Log 实时监控 Tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        
+        # 标题栏
+        title_layout = QHBoxLayout()
+        title_icon = QLabel("📜")
+        title_layout.addWidget(title_icon)
+        
+        title_label = QLabel("AP Log 实时监控")
+        title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title_label.setStyleSheet(f"color: {COLORS['text_primary']};")
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        
+        # 设备状态
+        self.aplog_device_status = StatusBadge("未连接设备", "default")
+        title_layout.addWidget(self.aplog_device_status)
+        layout.addLayout(title_layout)
+        
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet(f"background-color: {COLORS['divider']}; max-height: 1px;")
+        layout.addWidget(line)
+        
+        # 控制栏
+        control_layout = QHBoxLayout()
+        control_layout.setSpacing(12)
+        
+        # 开始/停止按钮 (使用QPushButton避免IconButton点击问题)
+        self.aplog_start_btn = QPushButton("▶️ 开始监控")
+        self.aplog_start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: white;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['success']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['success']}bb;
+            }}
+            QPushButton:disabled {{
+                background-color: {COLORS['divider']};
+                color: {COLORS['text_secondary']};
+            }}
+        """)
+        self.aplog_start_btn.clicked.connect(self._start_aplog_monitor)
+        control_layout.addWidget(self.aplog_start_btn)
+        
+        self.aplog_stop_btn = QPushButton("⏹️ 停止监控")
+        self.aplog_stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['error']};
+                color: white;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['error']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['error']}bb;
+            }}
+            QPushButton:disabled {{
+                background-color: {COLORS['divider']};
+                color: {COLORS['text_secondary']};
+            }}
+        """)
+        self.aplog_stop_btn.clicked.connect(self._stop_aplog_monitor)
+        self.aplog_stop_btn.setEnabled(False)
+        control_layout.addWidget(self.aplog_stop_btn)
+        
+        # 日志级别过滤
+        control_layout.addWidget(QLabel("级别:"))
+        self.aplog_level_combo = QComboBox()
+        self.aplog_level_combo.addItems(["Verbose (V)", "Debug (D)", "Info (I)", "Warning (W)", "Error (E)"])
+        self.aplog_level_combo.setCurrentIndex(0)
+        self.aplog_level_combo.setStyleSheet(f"""
+            QComboBox {{
+                padding: 6px 10px;
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                min-width: 100px;
+            }}
+        """)
+        control_layout.addWidget(self.aplog_level_combo)
+        
+        # 标签过滤
+        control_layout.addWidget(QLabel("标签:"))
+        self.aplog_tag_input = QLineEdit()
+        self.aplog_tag_input.setPlaceholderText("留空显示所有标签，多个用逗号分隔")
+        self.aplog_tag_input.setStyleSheet(f"""
+            QLineEdit {{
+                padding: 6px 10px;
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                min-width: 180px;
+            }}
+        """)
+        control_layout.addWidget(self.aplog_tag_input)
+        
+        control_layout.addStretch()
+        
+        # 清除和保存按钮 (使用QPushButton避免IconButton点击问题)
+        self.aplog_clear_btn = QPushButton("🗑️ 清除日志")
+        self.aplog_clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['warning']};
+                color: white;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['warning']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['warning']}bb;
+            }}
+        """)
+        self.aplog_clear_btn.clicked.connect(self._clear_aplog)
+        control_layout.addWidget(self.aplog_clear_btn)
+        
+        self.aplog_save_btn = QPushButton("💾 保存日志")
+        self.aplog_save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['primary']};
+                color: white;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['primary']}dd;
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['primary']}bb;
+            }}
+        """)
+        self.aplog_save_btn.clicked.connect(self._save_aplog)
+        control_layout.addWidget(self.aplog_save_btn)
+        
+        layout.addLayout(control_layout)
+        
+        # 日志显示区域
+        self.aplog_text = QTextEdit()
+        self.aplog_text.setReadOnly(True)
+        self.aplog_text.setFont(QFont("Consolas", 10))
+        self.aplog_text.setPlaceholderText("AP Log 将显示在这里...\n\n点击「开始监控」按钮开始实时读取手机日志")
+        self.aplog_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 12px;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(self.aplog_text, 1)  # stretch factor = 1
+        
+        # 状态栏
+        self.aplog_status = QLabel("就绪 - 未开始监控")
+        self.aplog_status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        layout.addWidget(self.aplog_status)
+        
+        # 初始化AP Log监控线程
+        self.aplog_worker = None
+        
+        return tab
 
     def _create_adb_tab(self) -> QWidget:
         """创建 ADB 终端 Tab"""
@@ -3634,6 +4881,139 @@ class MainWindow(QMainWindow):
         # 清空输入框
         self.adb_cmd_input.clear()
     
+    def _start_aplog_monitor(self):
+        """开始监控 AP Log"""
+        try:
+            print("[DEBUG APLog] _start_aplog_monitor 被调用")
+            
+            if not self.current_device:
+                QMessageBox.warning(self, "警告", "请先连接设备")
+                return
+            
+            print(f"[DEBUG APLog] 当前设备: {self.current_device.serial}")
+            
+            # 停止之前的监控
+            if hasattr(self, 'aplog_worker') and self.aplog_worker and self.aplog_worker.isRunning():
+                print("[DEBUG APLog] 停止之前的监控")
+                self.aplog_worker.stop()
+                self.aplog_worker.wait(1000)
+            
+            # 获取日志级别
+            level_map = {0: 'V', 1: 'D', 2: 'I', 3: 'W', 4: 'E'}
+            log_level = level_map.get(self.aplog_level_combo.currentIndex(), 'V')
+            print(f"[DEBUG APLog] 日志级别: {log_level}")
+            
+            # 获取标签过滤
+            tag_filter = self.aplog_tag_input.text().strip()
+            print(f"[DEBUG APLog] 标签过滤: {tag_filter}")
+            
+            # 创建并启动监控线程
+            print("[DEBUG APLog] 创建APLogWorker")
+            self.aplog_worker = APLogWorker(
+                self.current_device.serial,
+                log_level=log_level,
+                tag_filter=tag_filter
+            )
+            self.aplog_worker.log_signal.connect(self._on_aplog_received)
+            self.aplog_worker.status_signal.connect(self._on_aplog_status)
+            print("[DEBUG APLog] 启动APLogWorker")
+            self.aplog_worker.start()
+            
+            # 更新UI
+            self.aplog_start_btn.setEnabled(False)
+            self.aplog_stop_btn.setEnabled(True)
+            self.aplog_status.setText(f"正在监控 - 级别: {log_level}, 标签: {tag_filter if tag_filter else '全部'}")
+            self.aplog_status.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+            print("[DEBUG APLog] UI更新完成")
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"启动AP Log监控失败: {str(e)}"
+            print(f"[ERROR APLog] {error_msg}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "错误", f"{error_msg}\n\n请查看终端了解详情。")
+    
+    def _stop_aplog_monitor(self):
+        """停止监控 AP Log"""
+        if self.aplog_worker and self.aplog_worker.isRunning():
+            self.aplog_worker.stop()
+            self.aplog_worker.wait(1000)
+        
+        # 更新UI
+        self.aplog_start_btn.setEnabled(True)
+        self.aplog_stop_btn.setEnabled(False)
+        self.aplog_status.setText("已停止监控")
+        self.aplog_status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+    
+    def _on_aplog_received(self, message: str, log_type: str):
+        """接收 AP Log 消息"""
+        try:
+            # 限制日志行数，防止内存溢出
+            if self.aplog_text.document().blockCount() > 5000:
+                cursor = self.aplog_text.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                cursor.removeSelectedText()
+            
+            # 根据日志类型设置颜色
+            color_map = {
+                'V': '#808080',  # Verbose - 灰色
+                'D': '#4fc1e9',  # Debug - 蓝色
+                'I': '#a9dc76',  # Info - 绿色
+                'W': '#ffd700',  # Warning - 黄色
+                'E': '#ff6b6b',  # Error - 红色
+            }
+            color = color_map.get(log_type, '#cdd6f4')
+            
+            # 添加日志到显示区域
+            cursor = self.aplog_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            
+            from PyQt6.QtGui import QTextCharFormat
+            format = QTextCharFormat()
+            format.setForeground(QColor(color))
+            
+            cursor.insertText(message + '\n', format)
+            
+            # 自动滚动到底部
+            self.aplog_text.verticalScrollBar().setValue(
+                self.aplog_text.verticalScrollBar().maximum()
+            )
+        except Exception as e:
+            print(f"[ERROR APLog] _on_aplog_received: {e}")
+    
+    def _on_aplog_status(self, status: str):
+        """更新 AP Log 状态"""
+        self.aplog_status.setText(status)
+    
+    def _clear_aplog(self):
+        """清除 AP Log"""
+        self.aplog_text.clear()
+        self.aplog_status.setText("日志已清除")
+    
+    def _save_aplog(self):
+        """保存 AP Log 到文件"""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from datetime import datetime
+        
+        if not self.aplog_text.toPlainText().strip():
+            QMessageBox.information(self, "提示", "没有日志内容可保存")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "保存 AP Log",
+            f"aplog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "Text Files (*.txt);;Log Files (*.log)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.aplog_text.toPlainText())
+                QMessageBox.information(self, "成功", f"AP Log 已保存到:\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+    
     def _quick_adb_command(self, cmd: str):
         """执行快捷命令"""
         self.adb_cmd_input.setText(cmd)
@@ -3898,6 +5278,13 @@ class MainWindow(QMainWindow):
         self.adb_device_status.set_status("success")
         self._append_adb_output(f"✅ 设备已连接: {info.name}", "success")
         
+        # 更新 AP Log 设备状态
+        self.aplog_device_status.setText("已连接")
+        self.aplog_device_status.set_status("success")
+        
+        # 设备连接成功后，使用实际位置刷新地图
+        self._init_empty_map()
+        
         self.log(f"设备信息已更新: {info.name}", "success")
     
     def _update_sim_display(self, sim_id: str, sim: SimInfo):
@@ -3906,9 +5293,19 @@ class MainWindow(QMainWindow):
         operator_label = getattr(self, f"{sim_id}_operator_label")
         operator_label.setText(sim.operator if sim.operator != "Unknown" else "--")
         
-        # 手机号
+        # 手机号 - 从SIM卡读取，可能与实际号码不同
         number_label = getattr(self, f"{sim_id}_number_label")
-        number_label.setText(sim.phone_number if sim.phone_number != "Unknown" else "--")
+        if sim.phone_number not in ["Unknown", "未知", None, ""]:
+            number_text = sim.phone_number
+            # 添加提示：从SIM卡读取的号码可能不准确
+            number_label.setToolTip(f"从SIM卡读取的号码: {sim.phone_number}\n提示：SIM卡存储的号码可能与您的实际号码不同")
+        else:
+            number_text = "--"
+            number_label.setToolTip("无法读取SIM卡号码\n提示：请检查SIM卡是否正确插入")
+        number_label.setText(number_text)
+        
+        # 调试日志
+        print(f"[DEBUG] {sim_id} 号码更新: {number_text} (SIM卡存储，可能与实际号码不同)")
         
         # 网络类型
         network_label = getattr(self, f"{sim_id}_network_label")
@@ -3917,7 +5314,9 @@ class MainWindow(QMainWindow):
         # 状态标签
         status_badge = getattr(self, f"{sim_id}_status_badge")
         status_badge.setText(sim.state)
-        if sim.state == "就绪":
+        # 定义就绪状态（与start_calling中的检查保持一致）
+        ready_states = ["就绪", "已加载"]
+        if sim.state in ready_states:
             status_badge.set_status("success")
         elif sim.state == "未插入":
             status_badge.set_status("default")
@@ -3925,42 +5324,15 @@ class MainWindow(QMainWindow):
             status_badge.set_status("warning")
         
         # 信号强度
-        signal_bars = getattr(self, f"{sim_id}_signal_bars")
         signal_value = getattr(self, f"{sim_id}_signal_value")
         
-        # 根据信号强度设置颜色
-        signal_colors = {
-            0: COLORS['divider'],
-            1: COLORS['error'],
-            2: COLORS['warning'],
-            3: COLORS['info'],
-            4: COLORS['success']
-        }
-        signal_texts = {
-            0: "无信号",
-            1: "弱",
-            2: "一般",
-            3: "良好",
-            4: "强"
-        }
+        # 简化信号显示 - 只显示文字
+        signal_texts = {0: "无", 1: "弱", 2: "中", 3: "良", 4: "强"}
+        signal_text = signal_texts.get(sim.signal_level, f"{sim.signal_level}")
+        signal_value.setText(signal_text)
         
-        for i, bar in enumerate(signal_bars):
-            if i < sim.signal_level:
-                bar.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: {signal_colors.get(sim.signal_level, COLORS['divider'])};
-                        border-radius: 2px;
-                    }}
-                """)
-            else:
-                bar.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: {COLORS['divider']};
-                        border-radius: 2px;
-                    }}
-                """)
-        
-        signal_value.setText(signal_texts.get(sim.signal_level, "未知"))
+        # 调试日志
+        print(f"[DEBUG] {sim_id} 信号更新: level={sim.signal_level}, 显示={signal_text}")
     
     def clear_device_info(self):
         """清除设备信息显示"""
@@ -3999,43 +5371,96 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'adb_device_status'):
             self.adb_device_status.setText("未连接")
             self.adb_device_status.set_status("default")
+        
+        # 清除 AP Log 设备状态并停止监控
+        if hasattr(self, 'aplog_device_status'):
+            self.aplog_device_status.setText("未连接")
+            self.aplog_device_status.set_status("default")
+            self._stop_aplog_monitor()
+    
+    def _on_start_btn_clicked(self):
+        """开始按钮点击处理 - 包装函数用于捕获异常"""
+        print(f"[DEBUG] ========== 开始按钮被点击 ==========")
+        try:
+            self.start_calling()
+        except Exception as e:
+            import traceback
+            error_msg = f"开始测试时发生错误:\n{str(e)}"
+            detail_msg = traceback.format_exc()
+            print(f"[ERROR] {error_msg}\n{detail_msg}")
+            QMessageBox.critical(self, f"{ICONS['error']} 错误", f"{error_msg}\n\n请查看终端了解详情。")
     
     def start_calling(self):
         """开始拨打 - 使用右侧策略配置"""
+        print(f"[DEBUG] start_calling 被调用")
+        
         # 检查设备
+        print(f"[DEBUG] 检查设备: current_device={self.current_device}")
         if not self.current_device:
+            print(f"[DEBUG] 无设备连接，弹出警告")
             QMessageBox.warning(self, f"{ICONS['warning']} 警告", "请先连接设备！")
             return
+        print(f"[DEBUG] 设备已连接: {self.current_device.serial}")
         
         # 检查是否有策略
-        if not hasattr(self, 'strategies') or len(self.strategies) == 0:
+        has_strategies = hasattr(self, 'strategies')
+        strategies_count = len(self.strategies) if has_strategies else 0
+        print(f"[DEBUG] 检查策略: has_strategies={has_strategies}, count={strategies_count}")
+        
+        if not has_strategies or strategies_count == 0:
+            print(f"[DEBUG] 无策略，切换到策略Tab并弹出警告")
             # 如果没有策略，切换到策略Tab提示用户
             self.tab_widget.setCurrentIndex(0)
             QMessageBox.warning(self, f"{ICONS['warning']} 警告", 
                 "请先配置测试策略！\n\n请在右侧\"测试策略\"Tab中添加至少一个拨打策略。")
             return
+        print(f"[DEBUG] 策略检查通过，共 {strategies_count} 个策略")
         
         # 检查SIM卡状态
-        if self.current_device.sim1.state != "就绪" and self.current_device.sim2.state != "就绪":
+        sim1_state = self.current_device.sim1.state
+        sim2_state = self.current_device.sim2.state
+        print(f"[DEBUG] SIM卡状态检查:")
+        print(f"[DEBUG]   卡一状态='{sim1_state}', 类型={type(sim1_state)}")
+        print(f"[DEBUG]   卡二状态='{sim2_state}', 类型={type(sim2_state)}")
+        
+        # 定义就绪状态列表（包括"就绪"和"已加载"）
+        ready_states = ["就绪", "已加载", "READY", "LOADED"]
+        print(f"[DEBUG]   就绪状态列表: {ready_states}")
+        
+        sim1_ready = sim1_state in ready_states
+        sim2_ready = sim2_state in ready_states
+        print(f"[DEBUG]   卡一是否就绪: {sim1_ready}")
+        print(f"[DEBUG]   卡二是否就绪: {sim2_ready}")
+        
+        if not sim1_ready and not sim2_ready:
+            print(f"[DEBUG] 两张卡都未就绪，询问是否继续")
             reply = QMessageBox.question(
                 self, f"{ICONS['warning']} 确认",
-                "两张SIM卡都未就绪，是否继续？",
+                f"两张SIM卡都未就绪（卡一:{sim1_state}, 卡二:{sim2_state}），是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.No:
+                print(f"[DEBUG] 用户选择不继续")
                 return
+            print(f"[DEBUG] 用户选择继续")
         
         # 切换到日志Tab
+        print(f"[DEBUG] 切换到日志Tab")
         self.tab_widget.setCurrentIndex(1)
         
         # 开始执行策略
+        print(f"[DEBUG] 开始执行策略")
         self._execute_strategies()
     
     def _execute_strategies(self):
         """执行策略列表（支持电话和短信）"""
+        print(f"[DEBUG] _execute_strategies 被调用")
+        
         if not self.strategies:
+            print(f"[DEBUG] strategies为空，直接返回")
             return
         
+        print(f"[DEBUG] 开始执行策略，共 {len(self.strategies)} 个")
         self.log("开始执行测试策略...", "info")
         self.log(f"共有 {len(self.strategies)} 个策略", "info")
         
@@ -4044,11 +5469,52 @@ class MainWindow(QMainWindow):
         test_type = strategy.get('test_type', 'call')
         phone_number = strategy['target_num']
         
-        # 提取主号码（如果有多个）
-        if '/' in phone_number:
+        print(f"[DEBUG] 策略信息: type={test_type}, target_num={phone_number}")
+        
+        # 提取主号码 - 处理多种格式
+        # 格式1: "卡一(13810945276) / 卡二(无)" -> 提取第一个括号内的号码
+        # 格式2: "13810945276 / 13912345678" -> 取第一个
+        # 格式3: "13810945276(卡一)" -> 提取号码部分
+        import re
+        
+        # 先尝试提取所有数字号码（11位手机号）
+        all_numbers = re.findall(r'\b1[3-9]\d{9}\b', phone_number)
+        print(f"[DEBUG] 提取到的号码列表: {all_numbers}")
+        
+        if all_numbers:
+            phone_number = all_numbers[0]
+            self.log(f"从策略中提取号码: {phone_number}", "info")
+        else:
+            print(f"[DEBUG] 未找到标准手机号，尝试清理字符串")
+            # 如果没有找到标准号码，尝试清理字符串
+            # 移除常见的中文前缀
+            phone_number = re.sub(r'^卡[一二][：:\s]*', '', phone_number)
             phone_number = phone_number.split('/')[0].strip()
-        if '(' in phone_number:
             phone_number = phone_number.split('(')[0].strip()
+            phone_number = phone_number.split('（')[0].strip()
+            print(f"[DEBUG] 清理后的号码: {phone_number}")
+        
+        # 验证号码格式
+        if not re.match(r'^1[3-9]\d{9}$', phone_number):
+            print(f"[DEBUG] 号码格式验证失败: {phone_number}")
+            self.log(f"警告: 提取的号码格式可能不正确: {phone_number}", "warning")
+            
+            # 更明确的错误提示
+            if "未设置" in strategy['target_num'] or not phone_number:
+                QMessageBox.warning(self, f"{ICONS['warning']} 号码未设置", 
+                    f"策略中的目标号码未设置！\n\n"
+                    f"请先在右侧\"目标手机设置\"区域输入正确的目标号码，\n"
+                    f"然后点击\"添加策略\"重新添加。\n\n"
+                    f"当前策略内容: {strategy['target_num']}")
+            else:
+                QMessageBox.warning(self, f"{ICONS['warning']} 号码格式错误", 
+                    f"无法从策略中解析出有效的手机号码。\n\n"
+                    f"原始文本: {strategy['target_num']}\n"
+                    f"解析结果: {phone_number}\n\n"
+                    f"请检查目标号码设置。")
+            return
+        
+        print(f"[DEBUG] 号码验证通过: {phone_number}, 准备执行{test_type}")
         
         # 根据测试类型执行不同操作
         if test_type == 'sms':
@@ -4060,38 +5526,48 @@ class MainWindow(QMainWindow):
         """执行电话拨打策略"""
         duration = strategy['duration']
         count = strategy['count']
+        local_sim = strategy.get('local_sim', '本机卡一')
         
-        self.log(f"【电话拨打】号码: {phone_number}, 时长: {duration}秒, 次数: {count}", "info")
+        print(f"[DEBUG] _execute_call_strategy: duration={duration}, count={count}, phone={phone_number}")
+        self.log(f"【电话拨打】号码: {phone_number}, 时长: {duration}秒, 次数: {count}, SIM: {local_sim}", "info")
         
         # 更新UI状态
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.test_btn.setEnabled(True)
         self.test_status_badge.setText("通话中")
         self.test_status_badge.set_status("info")
         
         # 清空之前的位置记录
         self._clear_location_records()
         
-        # 创建CallWorker
+        # 创建CallWorker，传递SIM卡信息和Ping参数
+        print(f"[DEBUG] 创建CallWorker: duration={duration}, count={count}, ping_enabled={strategy.get('ping_enabled', False)}")
         self.call_worker = CallWorker(
             self.current_device.serial,
             phone_number,
             duration,
-            count
+            count,
+            sim_card=local_sim,
+            ping_enabled=strategy.get('ping_enabled', False),
+            ping_sim=strategy.get('ping_sim', ''),
+            ping_target=strategy.get('ping_target', ''),
+            interval=strategy.get('interval', 2)
         )
+        print(f"[DEBUG] CallWorker创建完成，self.call_worker.duration={self.call_worker.duration}")
         self.call_worker.log_signal.connect(self.on_log_received)
         self.call_worker.progress_signal.connect(self.on_progress)
         self.call_worker.status_signal.connect(self.on_status_update)
         self.call_worker.finished_signal.connect(self.on_calling_finished)
         # 连接位置记录信号
+        print(f"[DEBUG] 连接location_signal到_record_call_location")
         self.call_worker.location_signal.connect(self._record_call_location)
+        print(f"[DEBUG] location_signal已连接")
         # 连接结果记录信号
         self.call_worker.result_signal.connect(self._add_result_record)
         self.call_worker.start()
     
     def _execute_sms_strategy(self, strategy: dict, phone_number: str):
-        """执行短信发送策略"""
+        """执行短信发送策略（支持并发Ping）"""
         count = strategy['count']
         sms_content = strategy.get('sms_content', '测试短信')
         local_sim = strategy['local_sim']
@@ -4102,20 +5578,23 @@ class MainWindow(QMainWindow):
         # 更新UI状态
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.test_btn.setEnabled(True)
         self.test_status_badge.setText("发送短信中")
         self.test_status_badge.set_status("info")
         
         # 清空之前的位置记录
         self._clear_location_records()
         
-        # 创建SMSWorker（使用QThread）
+        # 创建SMSWorker（使用QThread，支持Ping）
         self.sms_worker = SMSWorker(
             self.current_device.serial,
             phone_number,
             sms_content,
             sim_slot,
-            count
+            count,
+            interval=strategy.get('interval', 2),
+            ping_enabled=strategy.get('ping_enabled', False),
+            ping_sim=strategy.get('ping_sim', ''),
+            ping_target=strategy.get('ping_target', '')
         )
         self.sms_worker.log_signal.connect(self.on_log_received)
         self.sms_worker.progress_signal.connect(self.on_progress)
@@ -4129,6 +5608,91 @@ class MainWindow(QMainWindow):
         if self.call_worker and self.call_worker.isRunning():
             self.call_worker.stop()
             self.log("正在停止拨打任务...", "warning")
+    
+    def _save_strategies(self):
+        """保存策略到文件"""
+        from PyQt6.QtWidgets import QFileDialog
+        
+        if not hasattr(self, 'strategies') or len(self.strategies) == 0:
+            QMessageBox.warning(self, f"{ICONS['warning']} 警告", "没有可保存的策略！")
+            return
+        
+        # 选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存策略", "strategies.json", "JSON文件 (*.json)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # 添加保存时间
+            data = {
+                'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'strategies': self.strategies
+            }
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            self.log(f"策略已保存到: {file_path}", "success")
+            QMessageBox.information(self, f"{ICONS['success']} 保存成功", 
+                f"已保存 {len(self.strategies)} 个策略到:\n{file_path}")
+        except Exception as e:
+            self.log(f"保存策略失败: {e}", "error")
+            QMessageBox.critical(self, f"{ICONS['error']} 保存失败", f"保存策略时出错:\n{str(e)}")
+    
+    def _load_strategies(self):
+        """从文件加载策略"""
+        from PyQt6.QtWidgets import QFileDialog
+        
+        # 选择文件
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "加载策略", "", "JSON文件 (*.json)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 支持直接是列表或包含strategies键的字典
+            if isinstance(data, list):
+                loaded_strategies = data
+            elif isinstance(data, dict) and 'strategies' in data:
+                loaded_strategies = data['strategies']
+            else:
+                raise ValueError("无效的策略文件格式")
+            
+            if not loaded_strategies:
+                QMessageBox.warning(self, f"{ICONS['warning']} 警告", "策略文件为空！")
+                return
+            
+            # 确认是否覆盖现有策略
+            if hasattr(self, 'strategies') and len(self.strategies) > 0:
+                reply = QMessageBox.question(
+                    self, f"{ICONS['warning']} 确认",
+                    f"当前已有 {len(self.strategies)} 个策略，是否覆盖？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.No:
+                    return
+            
+            # 加载策略
+            self.strategies = loaded_strategies
+            self._refresh_strategy_list()
+            self._update_strategy_stats()
+            
+            save_info = data.get('save_time', '未知时间')
+            self.log(f"策略已加载 (保存于: {save_info})", "success")
+            QMessageBox.information(self, f"{ICONS['success']} 加载成功", 
+                f"已加载 {len(loaded_strategies)} 个策略\n保存时间: {save_info}")
+            
+        except Exception as e:
+            self.log(f"加载策略失败: {e}", "error")
+            QMessageBox.critical(self, f"{ICONS['error']} 加载失败", f"加载策略时出错:\n{str(e)}")
     
     def on_log_received(self, message: str, log_type: str):
         """接收到日志消息"""
